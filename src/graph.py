@@ -82,11 +82,17 @@ async def orchestrator_node(state: TripState) -> dict:
             "_next": END,
         }
 
-    return {
+    result = {
         "current_agent": target,
         "_user_message": user_text,
         "_next": target,
     }
+
+    # Pass through routing echo (e.g. "Let me check with the research team...")
+    if direct_response and target != "orchestrator":
+        result["_routing_echo"] = direct_response
+
+    return result
 
 
 async def onboarding_node(state: TripState) -> dict:
@@ -106,6 +112,11 @@ async def onboarding_node(state: TripState) -> dict:
         logger.exception("Error in onboarding agent")
         response = "I encountered an issue. Please try again or send /help."
         updates = {}
+
+    # Prepend routing echo if present (e.g. welcome message on first /start)
+    routing_echo = state.get("_routing_echo", "")
+    if routing_echo:
+        response = f"{routing_echo}\n\n{response}"
 
     output = {
         "messages": [{"role": "assistant", "content": response}],
@@ -137,8 +148,22 @@ async def _specialist_node(agent_name: str, state: TripState) -> dict:
         updates = result.get("state_updates", {})
     except Exception:
         logger.exception("Error in %s agent", agent_name)
-        response = f"I encountered an issue. Please try again or send /help."
+        _agent_error_messages = {
+            "research": "I had trouble researching that. Try again or try a specific city.",
+            "planner": "I had trouble generating the plan. Try /plan again.",
+            "scheduler": "I had trouble building the agenda. Try /agenda again.",
+            "feedback": "I had trouble processing your feedback. Try /feedback again.",
+            "cost": "I had trouble with the cost calculation. Try /costs again.",
+        }
+        response = _agent_error_messages.get(
+            agent_name, "Something went wrong. Try your last command again."
+        )
         updates = {}
+
+    # Prepend routing echo if present (e.g. "Let me check with the research team...")
+    routing_echo = state.get("_routing_echo", "")
+    if routing_echo:
+        response = f"{routing_echo}\n\n{response}"
 
     history = add_to_conversation_history(state, "user", user_msg)
     history.append({

@@ -95,6 +95,27 @@ class TestHelpGeneration:
         for cmd in ("/start", "/research", "/plan", "/costs", "/feedback"):
             assert cmd in help_text
 
+    def test_help_includes_cost_subcommands(self):
+        help_text = generate_help()
+        assert "/costs today" in help_text
+        assert "/costs save" in help_text
+        assert "/costs convert" in help_text
+
+    def test_help_includes_adjust(self):
+        help_text = generate_help()
+        assert "/adjust" in help_text
+
+    def test_help_includes_groups(self):
+        help_text = generate_help()
+        assert "Setup" in help_text
+        assert "Research & Planning" in help_text
+        assert "On-Trip" in help_text
+        assert "Meta" in help_text
+
+    def test_help_includes_archive(self):
+        help_text = generate_help()
+        assert "/trip archive" in help_text
+
 
 class TestCommandRouting:
     """Test synchronous command-based routing (no LLM calls)."""
@@ -104,6 +125,14 @@ class TestCommandRouting:
         orch = OrchestratorAgent()
         result = await orch.route(empty_state, "/start")
         assert result["target_agent"] == "onboarding"
+        assert "welcome" in result.get("response", "").lower() or "get started" in result.get("response", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_start_after_onboarding_complete_returns_guard(self, japan_state):
+        orch = OrchestratorAgent()
+        result = await orch.route(japan_state, "/start")
+        assert result["target_agent"] == "orchestrator"
+        assert "/trip new" in result.get("response", "")
 
     @pytest.mark.asyncio
     async def test_status_returns_direct_response(self, japan_state):

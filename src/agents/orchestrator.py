@@ -92,6 +92,26 @@ class OrchestratorAgent(BaseAgent):
                 if cmd == "/trip":
                     return await self._handle_trip_command(state, message)
 
+                # Guard /start when onboarding is already complete
+                if cmd == "/start" and state.get("onboarding_complete"):
+                    return {
+                        "target_agent": "orchestrator",
+                        "response": (
+                            "Your trip is already set up! Use /trip new to plan another trip, "
+                            "or /status to see your current trip."
+                        ),
+                    }
+
+                # Welcome message on first /start
+                if cmd == "/start" and not state.get("onboarding_complete"):
+                    return {
+                        "target_agent": "onboarding",
+                        "response": (
+                            "Welcome to your travel planning assistant! "
+                            "I'll help you plan an amazing trip step by step. Let's get started!"
+                        ),
+                    }
+
                 # Check prerequisites before routing
                 guard = self._check_prerequisites(state, target)
                 if guard:
@@ -164,7 +184,18 @@ class OrchestratorAgent(BaseAgent):
             response_text = await self.invoke(state, message)
             return {"target_agent": "orchestrator", "response": response_text}
 
-        return {"target_agent": agent_name}
+        # Echo which agent is handling the request
+        _friendly_names = {
+            "research": "research team",
+            "planner": "planning team",
+            "scheduler": "scheduling team",
+            "feedback": "feedback team",
+            "cost": "budget team",
+            "prioritizer": "prioritization team",
+            "librarian": "knowledge base",
+        }
+        friendly = _friendly_names.get(agent_name, agent_name)
+        return {"target_agent": agent_name, "response": f"Let me check with the {friendly} for you..."}
 
     async def _handle_trip_command(self, state: TripState, message: str) -> dict[str, Any]:
         """Handle /trip new, /trip switch <id>, /trip archive <id>."""
@@ -215,8 +246,24 @@ def generate_status(state: TripState) -> str:
         f"{'✅' if prioritized else '❌'} Priorities: {len(prioritized)}/{len(cities)} cities",
         f"{'✅' if has_plan else '❌'} Itinerary: {'Approved' if plan_status == 'approved' else 'Draft' if has_plan else 'Not started'}",
         f"{'✅' if has_agenda else '❌'} Detailed agenda: {'Generated' if has_agenda else 'Not started'}",
-        f"💰 Budget: {currency} / ${spent:,.0f} spent",
+        f"💰 Budget: ${spent:,.0f} USD spent" + (f" ({currency})" if currency != "USD" else ""),
     ]
+
+    trip_id = state.get("trip_id")
+    if trip_id:
+        lines.append(f"\n🆔 Trip ID: `{trip_id}` — share with /join {trip_id}")
+
+    # Next-step suggestion
+    if not researched:
+        lines.append("\n👉 Next: /research all")
+    elif not prioritized:
+        lines.append("\n👉 Next: /priorities")
+    elif not has_plan:
+        lines.append("\n👉 Next: /plan")
+    elif not has_agenda:
+        lines.append("\n👉 Next: /agenda")
+    else:
+        lines.append("\n👉 You're all set! Use /feedback during your trip.")
 
     return "\n".join(lines)
 
@@ -224,22 +271,33 @@ def generate_status(state: TripState) -> str:
 def generate_help() -> str:
     """Return the help text listing all available commands."""
     return (
-        "Available commands:\n\n"
+        "Here's everything I can do:\n\n"
+        "--- Setup ---\n"
         "/start — Begin planning a new trip\n"
+        "/join <id> — Join a trip shared by a travel companion\n"
+        "/trip new — Start a new trip\n"
+        "/trip switch <id> — Switch to a different trip\n"
+        "/trip id — Show your current trip ID (shareable)\n"
+        "/trip archive <id> — Archive a completed trip\n\n"
+        "--- Research & Planning ---\n"
         "/research <city> — Research a specific city\n"
         "/research all — Research all cities\n"
         "/library — Sync your markdown knowledge base\n"
         "/priorities — View or adjust priority tiers\n"
         "/plan — Generate or view your itinerary\n"
-        "/agenda — Get detailed agenda for the next 2 days\n"
+        "/adjust — Adjust your plan based on feedback\n"
+        "/agenda — Get detailed agenda for the next 2 days\n\n"
+        "--- On-Trip ---\n"
         "/feedback — End-of-day check-in\n"
-        "/costs — View budget breakdown\n"
+        "/costs — View full budget breakdown\n"
+        "/costs today — Today's spending\n"
+        "/costs <city> — Spending for a city\n"
+        "/costs food — Spending by category\n"
+        "/costs save — Destination-specific savings tips\n"
+        "/costs convert <amount> — Quick currency conversion\n\n"
+        "--- Meta ---\n"
         "/status — Trip planning progress\n"
         "/trips — List all your trips\n"
-        "/trip new — Start a new trip\n"
-        "/trip switch <id> — Switch to a different trip\n"
-        "/trip id — Show your current trip ID (shareable)\n"
-        "/join <id> — Join a trip shared by a travel companion\n"
         "/help — Show this help message\n\n"
         "Or just chat naturally — I'll understand what you need!"
     )

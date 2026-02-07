@@ -81,6 +81,8 @@ When you have enough feedback, output a JSON block in ```json ... ``` with:
 
 Only output this JSON when you feel the conversation has naturally covered enough ground.
 If the conversation is still going, do NOT output JSON — just respond conversationally.
+
+Note: day calculations are based on UTC. If the traveler mentions a different local time, adjust accordingly.
 """
 
 

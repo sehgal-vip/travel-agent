@@ -128,7 +128,7 @@ class OnboardingAgent(BaseAgent):
         step = state.get("onboarding_step", 0)
 
         # Build context about what we already know
-        context_parts = [f"Current onboarding step: {step}"]
+        context_parts = [f"Current onboarding step: {step} (Step {step + 1} of 11) — mention progress naturally"]
         if state.get("destination", {}).get("country"):
             context_parts.append(f"Destination: {state['destination']['country']}")
         if state.get("cities"):

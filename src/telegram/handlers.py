@@ -34,7 +34,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     Flow: get user -> lookup active trip -> load prior state -> invoke graph -> merge & save -> reply.
     """
     if not update.message or not update.message.text:
-        await update.message.reply_text("I can only process text messages for now.")
+        await update.message.reply_text("I work with text messages and commands. Try /help to see what I can do!")
         return
 
     user_id = str(update.effective_user.id)
@@ -126,7 +126,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     except Exception:
         logger.exception("Error processing message for user %s", user_id)
-        response_text = "Something went wrong. Please try again or send /help for commands."
+        response_text = "Something went wrong processing your message. Try again, or use /help to see available commands."
     finally:
         typing_task.cancel()
 
@@ -157,7 +157,7 @@ async def _handle_join(
 
     trip = await repo.get_trip(trip_id)
     if not trip:
-        await update.message.reply_text(f"Trip `{trip_id}` not found. Please check the ID and try again.")
+        await update.message.reply_text(f"Trip '{trip_id}' not found. Use /trips to see your trips.")
         return
     if trip.archived:
         await update.message.reply_text(f"Trip `{trip_id}` has been archived and can no longer be joined.")
@@ -166,7 +166,7 @@ async def _handle_join(
     try:
         await repo.add_member(trip_id, user_id)
     except ValueError:
-        await update.message.reply_text(f"Trip `{trip_id}` not found.")
+        await update.message.reply_text(f"Trip '{trip_id}' not found. Use /trips to see your trips.")
         return
 
     context.user_data["active_trip_id"] = trip_id
@@ -180,7 +180,8 @@ async def _handle_join(
     await update.message.reply_text(
         f"You've joined the trip! {flag} {country}\n"
         f"Cities: {city_names}\n\n"
-        f"Trip `{trip_id}` is now your active trip. Use /status to see the full plan."
+        f"Trip `{trip_id}` is now your active trip.\n"
+        f"Use /status to see the full trip plan, or /help to see all commands."
     )
     logger.info("User %s joined trip %s", user_id, trip_id)
 
@@ -229,17 +230,24 @@ async def _handle_trip_management(
                 flag = state.get("destination", {}).get("flag_emoji", "")
                 await update.message.reply_text(f"Switched to trip: {flag} {country} ({target_id})")
             else:
-                await update.message.reply_text(f"Trip {target_id} not found.")
+                await update.message.reply_text(f"Trip '{target_id}' not found. Use /trips to see your trips.")
         return True
 
     if sub == "archive" and len(parts) >= 3:
         target_id = parts[2]
+        confirmed = len(parts) >= 4 and parts[3].lower() == "confirm"
+        if not confirmed:
+            await update.message.reply_text(
+                f"Are you sure you want to archive trip {target_id}? "
+                f"Send `/trip archive {target_id} confirm` to confirm."
+            )
+            return True
         if repo:
             try:
                 await repo.archive_trip(target_id)
                 await update.message.reply_text(f"Trip {target_id} archived.")
             except ValueError:
-                await update.message.reply_text(f"Trip {target_id} not found.")
+                await update.message.reply_text(f"Trip '{target_id}' not found. Use /trips to see your trips.")
         return True
 
     return False

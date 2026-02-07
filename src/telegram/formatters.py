@@ -63,7 +63,7 @@ def format_day_plan(day: dict, dest: dict) -> str:
             slot = meals.get(meal_type)
             if slot:
                 name = slot.get("name") or slot.get("type", "explore")
-                icon = {"breakfast": "☕", "lunch": "🍜", "dinner": "🍽️"}.get(meal_type, "🍽️")
+                icon = {"breakfast": "🌅", "lunch": "☀️", "dinner": "🌙"}.get(meal_type, "🍽️")
                 lines.append(f"  {icon} {meal_type.title()}: {name}")
 
     moment = day.get("special_moment")
@@ -120,7 +120,8 @@ def format_agenda_slot(slot: dict, dest: dict) -> str:
     booking = slot.get("booking_urgency")
     if booking:
         urgency_icon = {"book_now": "🔴", "book_today": "🟡", "walk_in": "🟢"}.get(booking, "")
-        lines.append(f"   {urgency_icon} {booking}")
+        legend = {"book_now": "reserve today", "book_today": "reserve this week", "walk_in": "no reservation needed"}.get(booking, "")
+        lines.append(f"   {urgency_icon} {booking}" + (f" ({legend})" if legend else ""))
 
     rain = slot.get("rain_backup")
     if rain:
@@ -151,7 +152,7 @@ def format_budget_report(state: dict) -> str:
     bar_empty = 20 - bar_filled
     progress_bar = "█" * bar_filled + "░" * bar_empty
 
-    status_emoji = {"under_budget": "✅", "on_track": "✅", "over_budget": "⚠️"}.get(status, "❓")
+    status_emoji = {"under_budget": "✅", "on_track": "📊", "over_budget": "⚠️"}.get(status, "❓")
 
     dates = state.get("dates", {})
     current_day = state.get("current_trip_day", 1)

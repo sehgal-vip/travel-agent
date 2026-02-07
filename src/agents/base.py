@@ -103,9 +103,14 @@ class BaseAgent:
             max_retries=settings.LLM_MAX_RETRIES,
         )
 
+    _TONE_PREAMBLE = (
+        "You are a friendly, knowledgeable travel assistant. "
+        "Be warm but concise. Use plain language.\n\n"
+    )
+
     def build_system_prompt(self, state: TripState) -> str:
-        """Combine agent-specific prompt with destination context."""
-        base_prompt = self.get_system_prompt()
+        """Combine tone preamble, agent-specific prompt, and destination context."""
+        base_prompt = self._TONE_PREAMBLE + self.get_system_prompt()
         dest_context = get_destination_context(state)
         return f"{base_prompt}\n{dest_context}" if dest_context else base_prompt
 

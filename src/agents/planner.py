@@ -197,10 +197,10 @@ class PlannerAgent(BaseAgent):
                 },
             }
 
-        # Fallback: use raw response
+        # Fallback: parse failed, nothing was saved
         return {
-            "response": response_text + "\n\nSay 'approved' to confirm or tell me what to change.",
-            "state_updates": {"plan_status": "draft"},
+            "response": "I generated a plan but couldn't parse it properly. Try /plan again.",
+            "state_updates": {},
         }
 
     async def _adjust_plan(self, state: TripState, message: str, current_plan: list) -> dict:

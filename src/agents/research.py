@@ -276,9 +276,9 @@ class ResearchAgent(BaseAgent):
 
             return {"response": summary, "state_updates": {"research": existing}}
 
-        # Fallback: use raw LLM response
+        # Fallback: parse failed, nothing was saved
         return {
-            "response": f"I've researched {city_name}. The results are being processed. Try /priorities when ready.",
+            "response": f"I wasn't able to parse the research results for {city_name}. Try `/research {city_name}` again.",
             "state_updates": {},
         }
 
