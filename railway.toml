@@ -1,0 +1,9 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+startCommand = "python -m src.main"
+restartPolicyType = "always"
+
+[[volumes]]
+mount = "/app/data"
