@@ -127,3 +127,64 @@ async def test_merge_state_nonexistent_raises(async_db):
     """Test that merge_state on a missing trip raises ValueError."""
     with pytest.raises(ValueError):
         await async_db.merge_state("nonexistent", {"foo": "bar"})
+
+
+# ── Trip member tests ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_add_member(async_db):
+    """Test adding a member and verifying is_member returns True for both owner and member."""
+    await async_db.create_trip("trip-shared", "owner-1", {"destination": {"country": "Japan"}})
+    await async_db.add_member("trip-shared", "member-1")
+
+    assert await async_db.is_member("trip-shared", "owner-1") is True
+    assert await async_db.is_member("trip-shared", "member-1") is True
+    assert await async_db.is_member("trip-shared", "stranger") is False
+
+
+@pytest.mark.asyncio
+async def test_add_member_idempotent(async_db):
+    """Test that adding the same member twice doesn't raise."""
+    await async_db.create_trip("trip-idem", "owner-1", {"destination": {"country": "Italy"}})
+    await async_db.add_member("trip-idem", "member-1")
+    await async_db.add_member("trip-idem", "member-1")  # should not raise
+
+    assert await async_db.is_member("trip-idem", "member-1") is True
+
+
+@pytest.mark.asyncio
+async def test_list_trips_includes_joined(async_db):
+    """Test that list_trips returns both owned and joined trips."""
+    await async_db.create_trip("trip-own", "user-A", {"destination": {"country": "Japan"}})
+    await async_db.create_trip("trip-other", "user-B", {"destination": {"country": "Morocco"}})
+    await async_db.add_member("trip-other", "user-A")
+
+    trips = await async_db.list_trips("user-A")
+    trip_ids = {t.trip_id for t in trips}
+    assert trip_ids == {"trip-own", "trip-other"}
+
+    # get_active_trips should also include joined trips
+    active = await async_db.get_active_trips("user-A")
+    active_ids = {t.trip_id for t in active}
+    assert active_ids == {"trip-own", "trip-other"}
+
+
+@pytest.mark.asyncio
+async def test_add_member_nonexistent_trip(async_db):
+    """Test that adding a member to a nonexistent trip raises ValueError."""
+    with pytest.raises(ValueError):
+        await async_db.add_member("nonexistent-trip", "user-1")
+
+
+@pytest.mark.asyncio
+async def test_owner_is_implicit_member(async_db):
+    """Test that add_member with owner user_id is a no-op and is_member returns True."""
+    await async_db.create_trip("trip-owner", "owner-1", {"destination": {"country": "France"}})
+    await async_db.add_member("trip-owner", "owner-1")  # should be no-op
+
+    assert await async_db.is_member("trip-owner", "owner-1") is True
+
+    # get_joined_trips should NOT include owned trips
+    joined = await async_db.get_joined_trips("owner-1")
+    assert len(joined) == 0

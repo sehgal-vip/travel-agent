@@ -35,7 +35,7 @@ def create_bot(graph, repo) -> Application:
     commands = [
         "start", "research", "library", "priorities", "plan",
         "agenda", "feedback", "costs", "adjust", "status",
-        "help", "trips", "trip",
+        "help", "trips", "trip", "join",
     ]
     for cmd in commands:
         app.add_handler(CommandHandler(cmd, process_message))

@@ -26,6 +26,7 @@ COMMAND_MAP: dict[str, str] = {
     "/help": "orchestrator",
     "/trips": "orchestrator",
     "/trip": "orchestrator",
+    "/join": "orchestrator",
 }
 
 # Agents that require prior steps to have been completed
@@ -237,6 +238,8 @@ def generate_help() -> str:
         "/trips — List all your trips\n"
         "/trip new — Start a new trip\n"
         "/trip switch <id> — Switch to a different trip\n"
+        "/trip id — Show your current trip ID (shareable)\n"
+        "/join <id> — Join a trip shared by a travel companion\n"
         "/help — Show this help message\n\n"
         "Or just chat naturally — I'll understand what you need!"
     )

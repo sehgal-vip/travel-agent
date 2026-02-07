@@ -16,7 +16,7 @@ class TestCommandMap:
     """Verify all expected commands are mapped."""
 
     def test_all_commands_present(self):
-        expected = {"/start", "/research", "/library", "/priorities", "/plan", "/agenda", "/feedback", "/costs", "/adjust", "/status", "/help", "/trips", "/trip"}
+        expected = {"/start", "/research", "/library", "/priorities", "/plan", "/agenda", "/feedback", "/costs", "/adjust", "/status", "/help", "/trips", "/trip", "/join"}
         assert expected == set(COMMAND_MAP.keys())
 
     def test_start_routes_to_onboarding(self):

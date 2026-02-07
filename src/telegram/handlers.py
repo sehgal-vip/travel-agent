@@ -53,7 +53,12 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Determine active trip & thread_id
     trip_id = context.user_data.get("active_trip_id", "default")
-    thread_id = f"{user_id}_{trip_id}"
+    thread_id = trip_id
+
+    # Handle /join command
+    if message_text.startswith("/join"):
+        await _handle_join(update, context, user_id, message_text, repo)
+        return
 
     # Special handling for trip management commands
     if message_text.startswith("/trip") and not message_text.startswith("/trips"):
@@ -110,7 +115,12 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 # Update active trip id if onboarding just completed
                 if result.get("trip_id") and result["trip_id"] != trip_id:
-                    context.user_data["active_trip_id"] = result["trip_id"]
+                    new_trip_id = result["trip_id"]
+                    context.user_data["active_trip_id"] = new_trip_id
+                    response_text += (
+                        f"\n\nYour trip ID is: `{new_trip_id}`\n"
+                        f"Share this with your travel companions — they can join with /join {new_trip_id}"
+                    )
             except Exception:
                 logger.exception("Failed to save state for trip %s", trip_id)
 
@@ -126,6 +136,55 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     logger.info("Response sent to user %s (%d chars)", user_id, len(response_text))
 
 
+async def _handle_join(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: str,
+    message: str,
+    repo,
+) -> None:
+    """Handle /join <trip_id> — join an existing trip as a member."""
+    parts = message.split()
+    if len(parts) < 2:
+        await update.message.reply_text("Usage: /join <trip_id>")
+        return
+
+    trip_id = parts[1]
+
+    if not repo:
+        await update.message.reply_text("Database is not available. Please try again later.")
+        return
+
+    trip = await repo.get_trip(trip_id)
+    if not trip:
+        await update.message.reply_text(f"Trip `{trip_id}` not found. Please check the ID and try again.")
+        return
+    if trip.archived:
+        await update.message.reply_text(f"Trip `{trip_id}` has been archived and can no longer be joined.")
+        return
+
+    try:
+        await repo.add_member(trip_id, user_id)
+    except ValueError:
+        await update.message.reply_text(f"Trip `{trip_id}` not found.")
+        return
+
+    context.user_data["active_trip_id"] = trip_id
+
+    state = json.loads(trip.state_json) if trip.state_json else {}
+    country = state.get("destination", {}).get("country", "Unknown")
+    flag = state.get("destination", {}).get("flag_emoji", "")
+    cities = state.get("cities", [])
+    city_names = ", ".join(c.get("name", "") for c in cities) if cities else "not set yet"
+
+    await update.message.reply_text(
+        f"You've joined the trip! {flag} {country}\n"
+        f"Cities: {city_names}\n\n"
+        f"Trip `{trip_id}` is now your active trip. Use /status to see the full plan."
+    )
+    logger.info("User %s joined trip %s", user_id, trip_id)
+
+
 async def _handle_trip_management(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -139,6 +198,15 @@ async def _handle_trip_management(
         return False
 
     sub = parts[1].lower()
+
+    if sub == "id":
+        active_id = context.user_data.get("active_trip_id", "default")
+        await update.message.reply_text(
+            f"Your current trip ID is: `{active_id}`\n"
+            f"Share this with your travel companions — they can join with /join {active_id}",
+            parse_mode="Markdown",
+        )
+        return True
 
     if sub == "new":
         import uuid
@@ -200,9 +268,10 @@ async def _list_trips(
         state = json.loads(trip.state_json) if trip.state_json else {}
         country = state.get("destination", {}).get("country", "Unknown")
         flag = state.get("destination", {}).get("flag_emoji", "")
+        role = "[owner]" if trip.user_id == user_id else "[member]"
         status = "📦 Archived" if trip.archived else "✅ Active"
         current = " ← current" if trip.trip_id == active_id else ""
-        lines.append(f"  {flag} {country} — {trip.trip_id} {status}{current}")
+        lines.append(f"  {flag} {country} — {trip.trip_id} {role} {status}{current}")
 
     lines.append("\nUse /trip switch <id> to change active trip.")
     await update.message.reply_text("\n".join(lines))
