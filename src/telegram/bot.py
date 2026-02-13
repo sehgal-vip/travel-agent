@@ -6,13 +6,14 @@ import logging
 
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
 )
 
 from src.config.settings import get_settings
-from src.telegram.handlers import process_message
+from src.telegram.handlers import handle_trip_selection, process_message
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +36,13 @@ def create_bot(graph, repo) -> Application:
     commands = [
         "start", "research", "library", "priorities", "plan",
         "agenda", "feedback", "costs", "adjust", "status",
-        "help", "trips", "trip", "join",
+        "help", "trips", "mytrips", "trip", "join",
     ]
     for cmd in commands:
         app.add_handler(CommandHandler(cmd, process_message))
+
+    # Inline button callbacks (trip switching)
+    app.add_handler(CallbackQueryHandler(handle_trip_selection, pattern="^trip_select:"))
 
     # Plain text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))

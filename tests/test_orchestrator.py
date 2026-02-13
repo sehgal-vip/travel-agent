@@ -16,7 +16,7 @@ class TestCommandMap:
     """Verify all expected commands are mapped."""
 
     def test_all_commands_present(self):
-        expected = {"/start", "/research", "/library", "/priorities", "/plan", "/agenda", "/feedback", "/costs", "/adjust", "/status", "/help", "/trips", "/trip", "/join"}
+        expected = {"/start", "/research", "/library", "/priorities", "/plan", "/agenda", "/feedback", "/costs", "/adjust", "/status", "/help", "/trips", "/mytrips", "/trip", "/join"}
         assert expected == set(COMMAND_MAP.keys())
 
     def test_start_routes_to_onboarding(self):
@@ -159,3 +159,33 @@ class TestCommandRouting:
         orch = OrchestratorAgent()
         result = await orch.route(empty_state, "I want to go to Japan")
         assert result["target_agent"] == "onboarding"
+
+
+class TestConversationalPrompt:
+    """Verify system prompt is conversational (no JSON instructions)."""
+
+    def test_system_prompt_has_no_json_instruction(self):
+        orch = OrchestratorAgent()
+        prompt = orch.get_system_prompt()
+        assert "JSON" not in prompt
+        assert "json" not in prompt
+
+    def test_system_prompt_is_conversational(self):
+        orch = OrchestratorAgent()
+        prompt = orch.get_system_prompt()
+        assert "conversational" in prompt.lower() or "clarifying question" in prompt.lower()
+
+
+class TestStateAwareClassification:
+    """Verify _get_state_summary provides useful context."""
+
+    def test_get_state_summary_with_research(self, japan_state):
+        japan_state["research"] = {"Tokyo": {"places": []}}
+        orch = OrchestratorAgent()
+        summary = orch._get_state_summary(japan_state)
+        assert "done" in summary  # research shows as done
+
+    def test_get_state_summary_empty(self, empty_state):
+        orch = OrchestratorAgent()
+        summary = orch._get_state_summary(empty_state)
+        assert "in progress" in summary

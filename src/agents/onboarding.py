@@ -73,6 +73,14 @@ CONVERSATION STYLE:
 - Offer smart defaults based on the destination
 - Be flexible: if they want to skip, move on
 
+SMART FLOW:
+- If context shows fields as ALREADY COLLECTED, acknowledge them briefly and move on
+- Focus your questions on the STILL NEEDED fields
+- You may ask about 2 related missing fields at once to speed things up
+- If only 1-2 fields remain, ask about them and then present the summary
+- NEVER assume or fill in information the user hasn't provided
+- NEVER skip asking about a field just because you can guess — always confirm with the user
+
 CURRENT STATE:
 You will receive the current onboarding step number and any data already collected.
 Track progress through step numbers:
@@ -112,6 +120,33 @@ If the user has NOT yet confirmed, do NOT output JSON. Just continue the convers
 """
 
 
+STEP_FIELD_MAP: list[tuple[int, str, str]] = [
+    # (step, state_key, human_label)
+    (0, "destination", "Destination"),
+    (1, "cities", "Cities"),
+    (2, "dates", "Travel dates"),
+    (3, "cities", "Days per city"),       # reuses cities — checks for 'days' key
+    (4, "travelers", "Traveler profile"),
+    (5, "budget", "Budget"),
+    (6, "interests", "Interests"),
+    (7, "travelers", "Dietary/accessibility"),  # checks dietary/accessibility keys
+    (8, "must_dos", "Must-dos & deal-breakers"),
+    (9, "accommodation_pref", "Accommodation"),
+    (10, "transport_pref", "Transport"),
+]
+
+
+def _fallback_title(dest: dict, cities: list) -> str:
+    """Deterministic fallback title when LLM title generation fails."""
+    country = dest.get("country", "Adventure")
+    if cities:
+        city_names = " & ".join(c.get("name", "") for c in cities[:2])
+        if len(cities) > 2:
+            city_names += f" +{len(cities) - 2}"
+        return f"{country}: {city_names}"
+    return f"{country} Trip"
+
+
 class OnboardingAgent(BaseAgent):
     agent_name = "onboarding"
 
@@ -127,20 +162,28 @@ class OnboardingAgent(BaseAgent):
         """
         step = state.get("onboarding_step", 0)
 
-        # Build context about what we already know
+        # Build context about what we already know and what's missing
+        filled, missing = self._compute_filled_and_missing(state)
         context_parts = [f"Current onboarding step: {step} (Step {step + 1} of 11) — mention progress naturally"]
+
+        if filled:
+            context_parts.append(f"ALREADY COLLECTED: {', '.join(filled)}")
+        # Add detail for collected fields
         if state.get("destination", {}).get("country"):
-            context_parts.append(f"Destination: {state['destination']['country']}")
+            context_parts.append(f"  Destination: {state['destination']['country']}")
         if state.get("cities"):
-            context_parts.append(f"Cities: {', '.join(c.get('name', '') for c in state['cities'])}")
+            context_parts.append(f"  Cities: {', '.join(c.get('name', '') for c in state['cities'])}")
         if state.get("dates", {}).get("start"):
-            context_parts.append(f"Dates: {state['dates']['start']} to {state['dates'].get('end', '?')}")
+            context_parts.append(f"  Dates: {state['dates']['start']} to {state['dates'].get('end', '?')}")
         if state.get("travelers", {}).get("type"):
-            context_parts.append(f"Travelers: {state['travelers']}")
+            context_parts.append(f"  Travelers: {state['travelers']}")
         if state.get("budget", {}).get("style"):
-            context_parts.append(f"Budget: {state['budget']['style']}")
+            context_parts.append(f"  Budget: {state['budget']['style']}")
         if state.get("interests"):
-            context_parts.append(f"Interests: {', '.join(state['interests'])}")
+            context_parts.append(f"  Interests: {', '.join(state['interests'])}")
+
+        if missing:
+            context_parts.append(f"STILL NEEDED: {', '.join(missing)}")
 
         context_str = "\n".join(context_parts)
 
@@ -167,6 +210,8 @@ class OnboardingAgent(BaseAgent):
             config = self._extract_config(response_text)
             if config:
                 state_updates = self._build_state_from_config(config, state)
+                title = await self._generate_trip_title(state_updates)
+                state_updates["trip_title"] = title
                 # Clean the response — remove JSON block for user display
                 clean_response = response_text.split("```json")[0].strip()
                 if not clean_response:
@@ -268,15 +313,75 @@ class OnboardingAgent(BaseAgent):
 
         return updates
 
+    def _field_is_filled(self, state: TripState, step: int) -> bool:
+        """Check whether the data for a given step is already present."""
+        if step == 0:
+            return bool(state.get("destination", {}).get("country"))
+        if step == 1:
+            return bool(state.get("cities"))
+        if step == 2:
+            return bool(state.get("dates", {}).get("start"))
+        if step == 3:
+            cities = state.get("cities", [])
+            return bool(cities and all(c.get("days") for c in cities))
+        if step == 4:
+            return bool(state.get("travelers", {}).get("type"))
+        if step == 5:
+            return bool(state.get("budget", {}).get("style"))
+        if step == 6:
+            return bool(state.get("interests"))
+        if step == 7:
+            t = state.get("travelers", {})
+            return "dietary" in t and "accessibility" in t
+        if step == 8:
+            return "must_dos" in state and state["must_dos"] is not None
+        if step == 9:
+            return bool(state.get("accommodation_pref"))
+        if step == 10:
+            return bool(state.get("transport_pref"))
+        return False
+
+    def _compute_filled_and_missing(self, state: TripState) -> tuple[list[str], list[str]]:
+        """Return (filled_labels, missing_labels) based on STEP_FIELD_MAP."""
+        filled, missing = [], []
+        for step_num, _key, label in STEP_FIELD_MAP:
+            if self._field_is_filled(state, step_num):
+                filled.append(label)
+            else:
+                missing.append(label)
+        return filled, missing
+
     def _estimate_step(self, state: TripState, message: str, current_step: int) -> int:
-        """Heuristic step advancement based on what state fields are populated."""
-        if state.get("destination", {}).get("country") and current_step < 1:
-            return 1
-        if state.get("cities") and current_step < 2:
-            return 2
-        if state.get("dates", {}).get("start") and current_step < 3:
-            return 3
-        # For later steps, increment by 1 per message if we're still progressing
-        if current_step < 10:
-            return current_step + 1
-        return current_step
+        """Jump to the first unfilled step, rather than incrementing by 1."""
+        for step_num, _key, _label in STEP_FIELD_MAP:
+            if not self._field_is_filled(state, step_num):
+                return max(step_num, current_step)
+        return 10  # all filled → go to summary/confirmation
+
+    async def _generate_trip_title(self, state_updates: dict) -> str:
+        """Generate a short, witty title for the trip using LLM."""
+        dest = state_updates.get("destination", {})
+        cities = state_updates.get("cities", [])
+        interests = state_updates.get("interests", [])
+        travelers = state_updates.get("travelers", {})
+        budget = state_updates.get("budget", {})
+        city_names = ", ".join(c.get("name", "") for c in cities)
+
+        prompt = (
+            "Generate a single witty, fun trip title (max 6 words). "
+            "Be creative and playful. No quotes. No emoji. Just the title.\n\n"
+            f"Country: {dest.get('country', '?')}\n"
+            f"Cities: {city_names}\n"
+            f"Travelers: {travelers.get('count', '?')} ({travelers.get('type', '?')})\n"
+            f"Style: {budget.get('style', '?')}\n"
+            f"Interests: {', '.join(interests)}\n\n"
+            "Examples: Ramen & Temples Run, Souks Spices & Sunsets, "
+            "Two Foodies Loose in Tuscany, Cherry Blossoms on a Budget"
+        )
+        try:
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            title = response.content.strip().strip('"').strip("'")
+            return title[:60] if len(title) > 60 else title
+        except Exception:
+            logger.warning("Failed to generate trip title, using fallback")
+            return _fallback_title(dest, cities)

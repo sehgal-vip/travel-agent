@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
@@ -66,8 +66,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if result:
             return
 
-    if message_text == "/trips":
-        await _list_trips(update, context, user_id, repo)
+    if message_text in ("/trips", "/mytrips"):
+        await _list_mytrips(update, context, user_id, repo)
         return
 
     # Start a background typing indicator refresh task
@@ -283,6 +283,165 @@ async def _list_trips(
 
     lines.append("\nUse /trip switch <id> to change active trip.")
     await update.message.reply_text("\n".join(lines))
+
+
+def _fallback_title_from_state(state: dict) -> str:
+    """Deterministic fallback title for trips that lack a trip_title."""
+    dest = state.get("destination", {})
+    cities = state.get("cities", [])
+    country = dest.get("country", "Adventure")
+    if cities:
+        city_names = " & ".join(c.get("name", "") for c in cities[:2])
+        if len(cities) > 2:
+            city_names += f" +{len(cities) - 2}"
+        return f"{country}: {city_names}"
+    return f"{country} Trip"
+
+
+def _format_date_range(start: str, end: str) -> str:
+    """Format ISO date strings into a compact range like 'Apr 1-14' or 'Mar 28 - Apr 5'."""
+    if not start or not end:
+        return ""
+    try:
+        from datetime import datetime as _dt
+        s = _dt.strptime(start, "%Y-%m-%d")
+        e = _dt.strptime(end, "%Y-%m-%d")
+        if s.month == e.month:
+            return f"{s.strftime('%b')} {s.day}-{e.day}"
+        return f"{s.strftime('%b')} {s.day} - {e.strftime('%b')} {e.day}"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _trip_progress_indicator(state: dict) -> str:
+    """Return a human-readable progress string based on state."""
+    if not state.get("onboarding_complete"):
+        return "Setting up"
+    if state.get("detailed_agenda"):
+        return "Scheduled"
+    if state.get("high_level_plan"):
+        return "Planned"
+    if state.get("priorities"):
+        return "Researched"
+    if state.get("research"):
+        return "Ready to prioritize"
+    return "Ready to research"
+
+
+async def _list_mytrips(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: str,
+    repo,
+) -> None:
+    """Handle /mytrips (and /trips) — rich trip listing with inline switch buttons."""
+    if not repo:
+        await update.message.reply_text("No trips found.")
+        return
+
+    trips = await repo.list_trips(user_id)
+    if not trips:
+        await update.message.reply_text("No trips yet. Send /start to plan your first trip!")
+        return
+
+    active_id = context.user_data.get("active_trip_id", "default")
+    lines = ["Your trips:\n"]
+    buttons = []
+
+    for trip in trips:
+        state = json.loads(trip.state_json) if trip.state_json else {}
+        dest = state.get("destination", {})
+        flag = dest.get("flag_emoji", "")
+        title = state.get("trip_title") or _fallback_title_from_state(state)
+        is_current = trip.trip_id == active_id
+        is_archived = trip.archived
+
+        # Route line: Tokyo > Kyoto > Osaka
+        cities = state.get("cities", [])
+        route = " > ".join(c.get("name", "") for c in cities) if cities else "No cities yet"
+
+        # Date range
+        dates = state.get("dates", {})
+        date_range = _format_date_range(dates.get("start", ""), dates.get("end", ""))
+
+        # Progress
+        progress = _trip_progress_indicator(state)
+
+        # Role
+        role = "owner" if trip.user_id == user_id else "member"
+
+        # Build display line
+        current_tag = " (current)" if is_current else ""
+        archived_tag = " [archived]" if is_archived else ""
+        header = f"{flag} {title}{current_tag}{archived_tag}"
+        detail_parts = []
+        if route:
+            detail_parts.append(route)
+        sub_parts = []
+        if date_range:
+            sub_parts.append(date_range)
+        sub_parts.append(progress)
+        sub_parts.append(role)
+        if sub_parts:
+            detail_parts.append(" · ".join(sub_parts))
+
+        lines.append(header)
+        for part in detail_parts:
+            lines.append(f"   {part}")
+        lines.append("")
+
+        # Add inline button for non-current, non-archived trips
+        if not is_current and not is_archived:
+            buttons.append(
+                [InlineKeyboardButton(f"{flag} {title}"[:40], callback_data=f"trip_select:{trip.trip_id}")]
+            )
+
+    text = "\n".join(lines).strip()
+    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+    await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+async def handle_trip_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button callback for trip switching."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if not data.startswith("trip_select:"):
+        return
+
+    trip_id = data.split(":", 1)[1]
+    user_id = str(update.effective_user.id)
+    repo = context.bot_data.get("repo")
+
+    if not repo:
+        await query.edit_message_text("Database is not available. Please try again later.")
+        return
+
+    trip = await repo.get_trip(trip_id)
+    if not trip:
+        await query.edit_message_text(f"Trip '{trip_id}' not found.")
+        return
+
+    # Verify user has access (owner or member)
+    user_trips = await repo.list_trips(user_id)
+    accessible_ids = {t.trip_id for t in user_trips}
+    if trip_id not in accessible_ids:
+        await query.edit_message_text("You don't have access to this trip.")
+        return
+
+    context.user_data["active_trip_id"] = trip_id
+
+    state = json.loads(trip.state_json) if trip.state_json else {}
+    dest = state.get("destination", {})
+    flag = dest.get("flag_emoji", "")
+    title = state.get("trip_title") or _fallback_title_from_state(state)
+
+    await query.edit_message_text(
+        f"Switched to: {flag} {title}\n\n"
+        f"Use /status to see your trip progress, or just chat to continue planning!"
+    )
+    logger.info("User %s switched to trip %s via inline button", user_id, trip_id)
 
 
 def _extract_response(result: dict) -> str:

@@ -419,6 +419,7 @@ class TripState(TypedDict, total=False):
 
     # Identity
     trip_id: str
+    trip_title: str  # Witty human-readable trip title
     created_at: str
     updated_at: str
 

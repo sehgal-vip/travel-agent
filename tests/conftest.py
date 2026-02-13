@@ -51,6 +51,7 @@ def japan_state() -> TripState:
     """A fully onboarded Japan trip state for testing post-onboarding agents."""
     return TripState(
         trip_id="japan-2026",
+        trip_title="Ramen & Temples Run",
         created_at="2026-02-01T00:00:00Z",
         updated_at="2026-02-01T00:00:00Z",
         destination={
@@ -140,6 +141,7 @@ def morocco_state() -> TripState:
     """A fully onboarded Morocco trip state — different continent, currency, climate."""
     return TripState(
         trip_id="morocco-2026",
+        trip_title="Souks Spices & Sunsets",
         created_at="2026-03-01T00:00:00Z",
         updated_at="2026-03-01T00:00:00Z",
         destination={

@@ -25,6 +25,7 @@ COMMAND_MAP: dict[str, str] = {
     "/status": "orchestrator",
     "/help": "orchestrator",
     "/trips": "orchestrator",
+    "/mytrips": "orchestrator",
     "/trip": "orchestrator",
     "/join": "orchestrator",
 }
@@ -50,25 +51,15 @@ class OrchestratorAgent(BaseAgent):
             "You are the Orchestrator of a multi-agent travel planning assistant. "
             "You work for ANY destination worldwide.\n\n"
             "Your job is to:\n"
-            "1. Interpret the user's message and determine intent\n"
-            "2. Route to the correct specialist agent\n"
-            "3. Handle meta-conversations (greetings, status checks, unclear requests)\n"
-            "4. Maintain conversation continuity across agent handoffs\n\n"
-            "ROUTING RULES:\n"
-            "- If no trip exists or onboarding is not complete → route to ONBOARDING\n"
-            "- Research requests → RESEARCH\n"
-            "- Priority/ranking questions → PRIORITIZER\n"
-            "- Library/knowledge base requests → LIBRARIAN\n"
-            "- Plan/itinerary requests → PLANNER\n"
-            "- Detailed agenda / 'what today' → SCHEDULER\n"
-            "- Feedback about their day → FEEDBACK\n"
-            "- Cost/budget/spending questions → COST\n\n"
-            "When intent is unclear, ask ONE clarifying question.\n"
-            "When just chatting, be friendly and suggest what they can do next.\n\n"
-            "NEVER expose internal agent names or system architecture.\n"
-            "NEVER assume any destination — always read from state.\n\n"
-            "Respond with ONLY a JSON object: {\"route\": \"<agent_name>\", \"message\": \"<any message to show user>\"}\n"
-            "Valid routes: onboarding, research, librarian, prioritizer, planner, scheduler, feedback, cost, orchestrator"
+            "1. Answer general questions about the user's trip\n"
+            "2. Help when the user's intent is unclear\n"
+            "3. Suggest what they can do next based on their trip progress\n\n"
+            "RULES:\n"
+            "- Be conversational and helpful\n"
+            "- NEVER expose internal agent names or system architecture\n"
+            "- NEVER assume any destination — always read from state\n"
+            "- When you're not sure what they want, ask ONE clarifying question\n"
+            "- Suggest relevant commands when appropriate"
         )
 
     async def route(self, state: TripState, message: str) -> dict[str, Any]:
@@ -87,7 +78,7 @@ class OrchestratorAgent(BaseAgent):
                     return {"target_agent": "orchestrator", "response": generate_status(state)}
                 if cmd == "/help":
                     return {"target_agent": "orchestrator", "response": generate_help()}
-                if cmd == "/trips":
+                if cmd in ("/trips", "/mytrips"):
                     return {"target_agent": "orchestrator", "response": "__list_trips__"}
                 if cmd == "/trip":
                     return await self._handle_trip_command(state, message)
@@ -142,8 +133,24 @@ class OrchestratorAgent(BaseAgent):
                 return msg
         return None
 
+    def _get_state_summary(self, state: TripState) -> str:
+        """One-line-per-field summary for classification context."""
+        parts = []
+        if state.get("onboarding_complete"):
+            dest = state.get("destination", {})
+            parts.append(f"Destination: {dest.get('country', '?')}")
+            parts.append(f"Research: {'done' if state.get('research') else 'not done'}")
+            parts.append(f"Priorities: {'done' if state.get('priorities') else 'not done'}")
+            parts.append(f"Plan: {'done' if state.get('high_level_plan') else 'not done'}")
+            parts.append(f"Agenda: {'done' if state.get('detailed_agenda') else 'not done'}")
+        else:
+            parts.append("Onboarding: in progress")
+        return "\n".join(parts)
+
     async def _classify_intent(self, state: TripState, message: str) -> dict[str, Any]:
         """Use LLM to classify natural-language intent into an agent route."""
+        state_summary = self._get_state_summary(state)
+
         classification_prompt = (
             "Classify the user's intent into one of these agents:\n"
             "- onboarding (trip setup, changes to trip config)\n"
@@ -154,7 +161,8 @@ class OrchestratorAgent(BaseAgent):
             "- scheduler (detailed agenda, what to do today/tomorrow)\n"
             "- feedback (how was today, rate experience, adjustments)\n"
             "- cost (budget, spending, money, prices, costs)\n"
-            "- orchestrator (general chat, unclear, greeting)\n\n"
+            "- orchestrator (general chat, unclear, greeting, 'what's next')\n\n"
+            f"TRIP STATE:\n{state_summary}\n\n"
             "Respond with ONLY the agent name, nothing else."
         )
 
@@ -297,7 +305,7 @@ def generate_help() -> str:
         "/costs convert <amount> — Quick currency conversion\n\n"
         "--- Meta ---\n"
         "/status — Trip planning progress\n"
-        "/trips — List all your trips\n"
+        "/mytrips — Browse and switch between your trips\n"
         "/help — Show this help message\n\n"
         "Or just chat naturally — I'll understand what you need!"
     )
