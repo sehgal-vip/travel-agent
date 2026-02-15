@@ -9,7 +9,7 @@ from typing import Any
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from src.agents.constants import AGENT_MAX_TOKENS, MEMORY_AGENTS
+from src.agents.constants import AGENT_MAX_RETRIES, AGENT_MAX_TOKENS, AGENT_TIMEOUTS, MEMORY_AGENTS
 from src.config.settings import get_settings
 from src.state import TripState
 
@@ -131,12 +131,14 @@ class BaseAgent:
         settings = get_settings()
         model_id = settings.AGENT_MODELS.get(self.agent_name, settings.DEFAULT_MODEL)
         max_tokens = AGENT_MAX_TOKENS.get(self.agent_name, 4096)
+        timeout = AGENT_TIMEOUTS.get(self.agent_name, settings.LLM_TIMEOUT)
+        max_retries = AGENT_MAX_RETRIES.get(self.agent_name, settings.LLM_MAX_RETRIES)
         self.llm = ChatAnthropic(
             model=model_id,
             anthropic_api_key=settings.ANTHROPIC_API_KEY,
             max_tokens=max_tokens,
-            timeout=settings.LLM_TIMEOUT,
-            max_retries=settings.LLM_MAX_RETRIES,
+            timeout=timeout,
+            max_retries=max_retries,
         )
 
     _TONE_PREAMBLE = (

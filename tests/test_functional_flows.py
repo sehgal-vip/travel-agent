@@ -491,6 +491,143 @@ class TestResearchFlow:
         response_lower = result["response"].lower()
         assert "research" in response_lower or "failed" in response_lower or "skipping" in response_lower
 
+    @pytest.mark.asyncio
+    async def test_research_timeout_retries_with_reduced_depth(self, japan_state):
+        """TC-RES-06: APITimeoutError triggers exponential retry with reduced depth."""
+        from anthropic import APITimeoutError
+        from src.agents.research import ResearchAgent
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city = AsyncMock(return_value=[])
+
+        city_json = json.dumps({
+            "places": [{"id": "t-1", "name": "Temple", "category": "place"}],
+            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
+        })
+
+        call_count = {"n": 0}
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            call_count["n"] += 1
+            # First call (full depth) times out, second call (half depth) succeeds
+            if call_count["n"] == 1:
+                raise APITimeoutError(request=MagicMock())
+            return AIMessage(content=city_json)
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke), \
+             patch("src.agents.research.asyncio.sleep", new_callable=AsyncMock):
+            result = await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 4})
+
+        assert "response" in result
+        assert result.get("state_updates", {}).get("research", {}).get("Tokyo") is not None
+        # ainvoke: 1 timeout + 1 research success + 1 abstract = 3
+        assert call_count["n"] == 3
+
+    @pytest.mark.asyncio
+    async def test_research_timeout_all_retries_exhausted(self, japan_state):
+        """TC-RES-07: All retry attempts timeout — exception propagates to _research_all_cities."""
+        from anthropic import APITimeoutError
+        from src.agents.research import ResearchAgent
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city = AsyncMock(return_value=[])
+
+        timeout_count = {"n": 0}
+
+        async def mock_ainvoke_always_timeout(self_llm, messages, **kwargs):
+            timeout_count["n"] += 1
+            raise APITimeoutError(request=MagicMock())
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke_always_timeout), \
+             patch("src.agents.research.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(APITimeoutError):
+                await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 4})
+
+        # Should have tried all 3 attempts (full, half, quarter depth)
+        assert timeout_count["n"] == len(ResearchAgent._RETRY_SCHEDULE)
+
+    @pytest.mark.asyncio
+    async def test_research_abstract_failure_preserves_data(self, japan_state):
+        """TC-RES-08: Abstract LLM call fails but research data is still saved."""
+        from src.agents.research import ResearchAgent
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city = AsyncMock(return_value=[])
+
+        city_json = json.dumps({
+            "places": [{"id": "t-1", "name": "Senso-ji", "category": "place"}],
+            "activities": [], "food": [{"id": "f-1", "name": "Ramen", "category": "food"}],
+            "logistics": [], "tips": [], "hidden_gems": [],
+        })
+
+        call_count = {"n": 0}
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Research LLM call succeeds
+                return AIMessage(content=city_json)
+            # Abstract LLM call fails
+            raise Exception("Rate limited")
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
+            result = await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 2})
+
+        # Research data should still be saved despite abstract failure
+        assert "Tokyo" in result["state_updates"]["research"]
+        research = result["state_updates"]["research"]["Tokyo"]
+        assert len(research["places"]) == 1
+        assert research["places"][0]["name"] == "Senso-ji"
+        # Response should contain fallback abstract
+        assert "Senso-ji" in result["response"] or "2 items" in result["response"]
+
+    @pytest.mark.asyncio
+    async def test_research_all_timeout_skips_and_continues(self, japan_state):
+        """TC-RES-09: In /research all, timed-out cities are skipped; others still attempted."""
+        from anthropic import APITimeoutError
+        from src.agents.research import ResearchAgent
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city = AsyncMock(return_value=[])
+
+        city_json = json.dumps({
+            "places": [{"id": "t-1", "name": "Temple", "category": "place"}],
+            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
+        })
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            # Check which city is being researched by scanning the prompt
+            prompt_text = messages[-1].content if messages else ""
+            if "Tokyo" in prompt_text:
+                raise APITimeoutError(request=MagicMock())
+            return AIMessage(content=city_json)
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke), \
+             patch("src.agents.research.asyncio.sleep", new_callable=AsyncMock):
+            result = await agent.handle(japan_state, "/research all")
+
+        response = result["response"]
+        # Tokyo should fail (all retry attempts timeout)
+        assert "failed" in response.lower() or "⚠️" in response
+        # Other cities should have been attempted
+        assert "Kyoto" in response or "Osaka" in response
+        # Overall research should still complete
+        assert "Research complete" in response
+
+    @pytest.mark.asyncio
+    async def test_per_agent_timeout_and_retries_applied(self):
+        """TC-RES-10: Research agent uses per-agent timeout and retries, not defaults."""
+        from src.agents.research import ResearchAgent
+        from src.agents.constants import AGENT_MAX_RETRIES, AGENT_TIMEOUTS
+
+        agent = ResearchAgent()
+        assert agent.llm.default_request_timeout == AGENT_TIMEOUTS["research"]
+        assert agent.llm.max_retries == AGENT_MAX_RETRIES["research"]
+
 
 # =============================================================================
 # PRIORITIZER TESTS

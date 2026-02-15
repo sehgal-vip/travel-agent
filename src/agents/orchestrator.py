@@ -450,7 +450,9 @@ def generate_status(state: TripState) -> str:
 
     trip_id = state.get("trip_id")
     if trip_id:
-        lines.append(f"\n🆔 Trip ID: `{trip_id}` — share with /join {trip_id}")
+        trip_title = state.get("trip_title") or f"{dest.get('country', 'Your')} Trip"
+        lines.append(f"\n✈️ *{trip_title}*")
+        lines.append(f"🆔 Trip ID: `{trip_id}` — share with /join {trip_id}")
 
     # Next-step suggestion
     if not researched:

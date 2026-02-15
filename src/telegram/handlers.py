@@ -232,9 +232,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     except Exception:
                         logger.exception("Failed to migrate state to new trip %s", new_trip_id)
 
+                    trip_name = result.get("trip_title") or _fallback_title_from_state(result)
                     response_text += (
-                        f"\n\nYour trip ID is: `{new_trip_id}`\n"
-                        f"Share this with your travel companions — they can join with /join {new_trip_id}"
+                        f"\n\n✈️ *{trip_name}*\n"
+                        f"Trip ID: `{new_trip_id}` — share with /join {new_trip_id}"
                     )
 
                     # Auto-start research after onboarding completes
@@ -324,8 +325,9 @@ async def _handle_join(
     cities = state.get("cities", [])
     city_names = ", ".join(c.get("name", "") for c in cities) if cities else "not set yet"
 
+    title = state.get("trip_title") or _fallback_title_from_state(state)
     await update.message.reply_text(
-        f"You've joined the trip! {flag} {country}\n"
+        f"You've joined *{title}*! {flag}\n"
         f"Cities: {city_names}\n\n"
         f"Trip `{trip_id}` is now your active trip.\n"
         f"Use /status to see the full trip plan, or /help to see all commands."
@@ -349,9 +351,16 @@ async def _handle_trip_management(
 
     if sub == "id":
         active_id = context.user_data.get("active_trip_id", "default")
+        title = active_id
+        if repo:
+            trip = await repo.get_trip(active_id)
+            if trip and trip.state_json:
+                st = json.loads(trip.state_json)
+                title = st.get("trip_title") or _fallback_title_from_state(st)
         await update.message.reply_text(
-            f"Your current trip ID is: `{active_id}`\n"
-            f"Share this with your travel companions — they can join with /join {active_id}",
+            f"✈️ *{title}*\n"
+            f"Trip ID: `{active_id}`\n"
+            f"Share with: /join {active_id}",
             parse_mode="Markdown",
         )
         return True
@@ -373,9 +382,9 @@ async def _handle_trip_management(
             if trip:
                 context.user_data["active_trip_id"] = target_id
                 state = json.loads(trip.state_json) if trip.state_json else {}
-                country = state.get("destination", {}).get("country", "Unknown")
                 flag = state.get("destination", {}).get("flag_emoji", "")
-                await update.message.reply_text(f"Switched to trip: {flag} {country} ({target_id})")
+                title = state.get("trip_title") or _fallback_title_from_state(state)
+                await update.message.reply_text(f"Switched to: {flag} *{title}* (`{target_id}`)")
             else:
                 await update.message.reply_text(f"Trip '{target_id}' not found. Use /trips to see your trips.")
         return True

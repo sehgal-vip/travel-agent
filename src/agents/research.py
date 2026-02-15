@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -290,31 +291,13 @@ class ResearchAgent(BaseAgent):
         currency_code = dest.get("currency_code", "USD")
         exchange_rate = dest.get("exchange_rate_to_usd", 1)
 
-        prompt = (
-            f"Research {city_name}, {country} for a {traveler_type} trip of {days} days.\n"
-            f"Interests: {', '.join(interests)}\n"
-            f"Currency: {currency_code} (1 USD = {exchange_rate} {currency_code})\n"
-            f"Target depth: {depth}\n\n"
-            f"Web search results:\n{search_context}\n\n"
-            "Return a JSON object with keys: places, activities, food, logistics, tips, hidden_gems. "
-            "Each is an array of research items following the schema. "
-            "For each item, include confidence fields: "
-            "source_recency (year string), corroborating_sources (int, how many results mention it), "
-            "review_volume ('high'/'medium'/'low'/'unknown'), "
-            "confidence_score (0.0-1.0 based on recency, corroboration, and review volume). "
-            "Output ONLY valid JSON, no markdown."
-        )
-
         system = self.build_system_prompt(state)
-        messages = [SystemMessage(content=system), HumanMessage(content=prompt)]
 
-        logger.info("LLM synthesis starting: city research for %s (%d days)", city_name, days)
-        response = await self.llm.ainvoke(messages)
-        logger.info(
-            "LLM synthesis complete: city research for %s (chars=%d, est_tokens=%d, max_tokens=%d)",
-            city_name, len(response.content), len(response.content) // 3, self.llm.max_tokens,
+        # Try full-depth research first; on timeout, retry with reduced depth
+        research_data = await self._llm_research_with_fallback(
+            city_name, country, days, interests, traveler_type,
+            depth, currency_code, exchange_rate, search_context, system,
         )
-        research_data = self._parse_json(response.content)
 
         if research_data:
             research_data["last_updated"] = datetime.now(timezone.utc).isoformat()
@@ -331,7 +314,106 @@ class ResearchAgent(BaseAgent):
                 for k in ("places", "activities", "food", "logistics", "tips", "hidden_gems")
             )
 
-            # Generate a conversational abstract
+            # Generate a conversational abstract (non-critical — don't lose research on failure)
+            abstract_text = await self._generate_abstract(city_name, traveler_type, days, interests, research_data, total)
+
+            summary = (
+                f"**{city_name}** — {total} items found\n\n"
+                f"{abstract_text}\n\n"
+                f"_Say 'tell me more about food' or 'what are the hidden gems?' to go deeper._"
+            )
+
+            return {"response": summary, "state_updates": {"research": existing}}
+
+        # Fallback: parse failed, nothing was saved
+        return {
+            "response": f"I wasn't able to parse the research results for {city_name}. Try `/research {city_name}` again.",
+            "state_updates": {},
+        }
+
+    # Retry schedule: each entry is (depth_divisor, extra_timeout_seconds).
+    # Depth is halved each round; timeout grows exponentially via asyncio.sleep backoff.
+    _RETRY_SCHEDULE = [
+        (1, 0),    # attempt 0: full depth, no extra wait
+        (2, 5),    # attempt 1: half depth, 5s backoff
+        (4, 15),   # attempt 2: quarter depth, 15s backoff
+    ]
+
+    async def _llm_research_with_fallback(
+        self, city_name: str, country: str, days: int,
+        interests: list[str], traveler_type: str,
+        depth: dict[str, int], currency_code: str,
+        exchange_rate, search_context: str, system: str,
+    ) -> dict | None:
+        """Call LLM for city research JSON with exponential backoff and depth reduction.
+
+        Retries up to len(_RETRY_SCHEDULE) times, halving the requested depth and
+        adding an exponentially growing backoff between attempts.  Each individual
+        LLM call still benefits from langchain-anthropic's own max_retries.
+        """
+        from anthropic import APITimeoutError
+
+        last_err: Exception | None = None
+
+        for attempt, (divisor, backoff_s) in enumerate(self._RETRY_SCHEDULE):
+            current_depth = {k: max(v // divisor, 2) for k, v in depth.items()}
+            prompt = self._build_research_prompt(
+                city_name, country, days, interests, traveler_type,
+                current_depth, currency_code, exchange_rate, search_context,
+            )
+            messages = [SystemMessage(content=system), HumanMessage(content=prompt)]
+
+            if attempt == 0:
+                logger.info("LLM synthesis starting: city research for %s (%d days, depth=%s)", city_name, days, current_depth)
+            else:
+                logger.warning(
+                    "LLM retry %d/%d for %s: depth=%s, backoff=%ds",
+                    attempt, len(self._RETRY_SCHEDULE) - 1, city_name, current_depth, backoff_s,
+                )
+                await asyncio.sleep(backoff_s)
+
+            try:
+                response = await self.llm.ainvoke(messages)
+                logger.info(
+                    "LLM synthesis complete: city research for %s (chars=%d, est_tokens=%d, max_tokens=%d, attempt=%d)",
+                    city_name, len(response.content), len(response.content) // 3, self.llm.max_tokens, attempt,
+                )
+                return self._parse_json(response.content)
+            except APITimeoutError as exc:
+                last_err = exc
+                logger.warning("LLM timed out for %s (attempt %d/%d)", city_name, attempt, len(self._RETRY_SCHEDULE) - 1)
+
+        # All retries exhausted
+        raise last_err  # type: ignore[misc]
+
+    @staticmethod
+    def _build_research_prompt(
+        city_name: str, country: str, days: int,
+        interests: list[str], traveler_type: str,
+        depth: dict[str, int], currency_code: str,
+        exchange_rate, search_context: str,
+    ) -> str:
+        return (
+            f"Research {city_name}, {country} for a {traveler_type} trip of {days} days.\n"
+            f"Interests: {', '.join(interests)}\n"
+            f"Currency: {currency_code} (1 USD = {exchange_rate} {currency_code})\n"
+            f"Target depth: {depth}\n\n"
+            f"Web search results:\n{search_context}\n\n"
+            "Return a JSON object with keys: places, activities, food, logistics, tips, hidden_gems. "
+            "Each is an array of research items following the schema. "
+            "For each item, include confidence fields: "
+            "source_recency (year string), corroborating_sources (int, how many results mention it), "
+            "review_volume ('high'/'medium'/'low'/'unknown'), "
+            "confidence_score (0.0-1.0 based on recency, corroboration, and review volume). "
+            "Output ONLY valid JSON, no markdown."
+        )
+
+    async def _generate_abstract(
+        self, city_name: str, traveler_type: str, days: int,
+        interests: list[str], research_data: dict, total: int,
+    ) -> str:
+        """Generate a conversational abstract. Returns fallback text on failure."""
+        try:
             abstract_prompt = (
                 f"You just researched {city_name} for a {traveler_type} trip ({days} days).\n"
                 f"Interests: {', '.join(interests)}\n\n"
@@ -352,20 +434,16 @@ class ResearchAgent(BaseAgent):
                 })),
             ]
             abstract_response = await self.llm.ainvoke(abstract_messages)
-
-            summary = (
-                f"**{city_name}** — {total} items found\n\n"
-                f"{abstract_response.content}\n\n"
-                f"_Say 'tell me more about food' or 'what are the hidden gems?' to go deeper._"
-            )
-
-            return {"response": summary, "state_updates": {"research": existing}}
-
-        # Fallback: parse failed, nothing was saved
-        return {
-            "response": f"I wasn't able to parse the research results for {city_name}. Try `/research {city_name}` again.",
-            "state_updates": {},
-        }
+            return abstract_response.content
+        except Exception:
+            logger.warning("Abstract generation failed for %s, using fallback summary", city_name)
+            top_items = [
+                p.get("name") for p in research_data.get("places", [])[:3]
+            ] + [
+                f.get("name") for f in research_data.get("food", [])[:2]
+            ]
+            highlights = ", ".join(item for item in top_items if item)
+            return f"Found {total} items including {highlights}. Ask me about any category to dive deeper."
 
     async def _research_all_cities(self, state: TripState) -> dict:
         """Research all cities in sequence."""
