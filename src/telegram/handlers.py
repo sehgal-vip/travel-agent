@@ -99,11 +99,17 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 existing_trip = await repo.get_trip(trip_id)
                 if existing_trip and existing_trip.state_json:
                     prior_state = json.loads(existing_trip.state_json)
-                    # Spread prior state under input; checkpointer takes precedence
+                    # Spread prior state under input; input overrides checkpointer
                     input_state = {**prior_state, "messages": [{"role": "user", "content": message_text}]}
                     logger.info("Loaded prior state for trip %s (keys: %s)", trip_id, list(prior_state.keys()))
             except Exception:
                 logger.exception("Failed to load prior state for trip %s", trip_id)
+
+        # Always reset internal graph keys so stale checkpointer state
+        # doesn't block new user messages (e.g. _loopback_depth stuck > 5)
+        input_state["_loopback_depth"] = 0
+        input_state["_error_agent"] = None
+        input_state["_error_context"] = None
 
         # Pre-graph slash command dispatch (v2)
         if message_text.startswith("/"):
@@ -247,6 +253,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         response_text = ""  # Clear so we don't send twice
 
                         research_input = {**state_to_save, "messages": [{"role": "user", "content": "/research all"}]}
+                        research_input["_loopback_depth"] = 0
                         research_config = {"configurable": {"thread_id": new_trip_id}}
                         research_result = await graph.ainvoke(research_input, config=research_config)
 
