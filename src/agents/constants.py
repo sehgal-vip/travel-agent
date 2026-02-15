@@ -3,7 +3,7 @@
 MEMORY_AGENTS = {"research", "planner", "scheduler", "prioritizer", "feedback", "cost"}
 
 AGENT_MAX_TOKENS: dict[str, int] = {
-    "research": 75000,   # iterative per-category calls use less but ceiling is high
+    "research": 16384,   # per-category calls need ~2-5k; 16k covers destination intel too
     "planner": 16384,
     "scheduler": 8192,
     "prioritizer": 8192,
