@@ -41,16 +41,10 @@ Research and compile:
 - SIM card / connectivity situation
 - Health advisories (vaccines, water safety, altitude, etc.)
 
-━━━ MODE 2: CITY RESEARCH ━━━
-Run for each city. Research across these dimensions:
-1. Places to Visit — landmarks, temples/churches/mosques, viewpoints, neighborhoods, natural sites, museums, parks
-2. Things to Do — activities, tours, experiences, workshops, day trips
-3. Food & Drink — must-try local dishes, specific restaurants/stalls/markets, food streets
-4. Logistics — internal transport, best areas to stay, neighborhood guide
-5. Local Tips — best time of day for key spots, money-saving hacks
-6. Hidden Gems — lesser-known spots, local favorites
+━━━ MODE 2: CITY RESEARCH (per-category) ━━━
+Run for each city. You will be asked to research ONE category at a time.
 
-FOR EACH ITEM, output a JSON object with these fields:
+FOR EACH ITEM, output a JSON object with these fields (ResearchItem schema):
 {
     "id": "{city_slug}-{category}-{number}",
     "name": "...",
@@ -75,24 +69,29 @@ FOR EACH ITEM, output a JSON object with these fields:
     "must_try_items": [...] or null
 }
 
-RESEARCH DEPTH:
-- 4+ days in city: 20 places, 15 activities, 25 food items
-- 2-3 days: 10 places, 8 activities, 15 food items
-- 1 day: 5 places, 5 activities, 8 food items
-
 Output your response as a JSON object. For Mode 1, use the DestinationIntel schema.
-For Mode 2, wrap items in: {"places": [...], "activities": [...], "food": [...], "logistics": [...], "tips": [...], "hidden_gems": [...]}
+For Mode 2, return a single-key JSON: {"<category_key>": [...]}
 """
+
+# Category definitions: (key, label, description)
+RESEARCH_CATEGORIES = [
+    ("places", "Places to Visit", "landmarks, temples, viewpoints, neighborhoods, natural sites, museums, parks"),
+    ("activities", "Things to Do", "activities, tours, experiences, workshops, day trips"),
+    ("food", "Food & Drink", "must-try local dishes, specific restaurants, stalls, markets, food streets"),
+    ("logistics", "Logistics", "internal transport, best areas to stay, neighborhood guide"),
+    ("tips", "Local Tips", "best time of day for key spots, money-saving hacks, practical tips"),
+    ("hidden_gems", "Hidden Gems", "lesser-known spots, local favorites, off-the-beaten-path"),
+]
 
 
 def _get_research_depth(days: int) -> dict[str, int]:
     if days >= 4:
-        return {"places": 20, "activities": 15, "food": 25}
+        return {"places": 20, "activities": 15, "food": 25, "logistics": 5, "tips": 5, "hidden_gems": 8}
     elif days >= 2:
-        return {"places": 10, "activities": 8, "food": 15}
+        return {"places": 10, "activities": 8, "food": 15, "logistics": 3, "tips": 3, "hidden_gems": 5}
     elif days == 1:
-        return {"places": 5, "activities": 5, "food": 8}
-    return {"places": 3, "activities": 2, "food": 5}
+        return {"places": 5, "activities": 5, "food": 8, "logistics": 2, "tips": 2, "hidden_gems": 3}
+    return {"places": 3, "activities": 2, "food": 5, "logistics": 2, "tips": 2, "hidden_gems": 2}
 
 
 class ResearchAgent(BaseAgent):
@@ -262,7 +261,9 @@ class ResearchAgent(BaseAgent):
         }
 
     async def _research_city(self, state: TripState, city: dict) -> dict:
-        """Mode 2: Research a single city."""
+        """Mode 2: Research a single city using iterative per-category calls."""
+        from anthropic import APITimeoutError
+
         city_name = city.get("name", "")
         country = city.get("country") or state.get("destination", {}).get("country", "")
         days = city.get("days", 2)
@@ -278,133 +279,139 @@ class ResearchAgent(BaseAgent):
             logger.info("Research for %s is stale (%d days old, trip in %s days), refreshing",
                         city_name, freshness["age_days"], freshness.get("days_until_trip"))
 
-        # Web search
-        search_results = await self.search_tool.search_city(
-            city_name, country, interests, traveler_type
-        )
-        search_context = "\n".join(
-            f"- {r.get('title', '')}: {r.get('content', '')[:400]}"
-            for r in search_results[:18]
-        )
-
         dest = state.get("destination", {})
         currency_code = dest.get("currency_code", "USD")
         exchange_rate = dest.get("exchange_rate_to_usd", 1)
 
         system = self.build_system_prompt(state)
+        accumulated: dict[str, list] = {}  # category_key → list of items
 
-        # Try full-depth research first; on timeout, retry with reduced depth
-        research_data = await self._llm_research_with_fallback(
-            city_name, country, days, interests, traveler_type,
-            depth, currency_code, exchange_rate, search_context, system,
+        for cat_key, cat_label, cat_desc in RESEARCH_CATEGORIES:
+            try:
+                # 1. Category-specific web search
+                search_results = await self.search_tool.search_city_category(
+                    city_name, country, cat_key, interests, traveler_type,
+                )
+                search_context = "\n".join(
+                    f"- {r.get('title', '')}: {r.get('content', '')[:400]}"
+                    for r in search_results[:10]
+                )
+
+                # 2. Build focused prompt with iterative context
+                prompt = self._build_category_prompt(
+                    city_name, country, days, interests, traveler_type,
+                    cat_key, cat_label, cat_desc,
+                    depth, currency_code, exchange_rate,
+                    search_context, accumulated,
+                )
+
+                # 3. LLM call with timeout retry (reduced depth on retry)
+                messages = [SystemMessage(content=system), HumanMessage(content=prompt)]
+                logger.info("LLM category %s starting for %s (target=%d)", cat_key, city_name, depth.get(cat_key, 5))
+
+                try:
+                    response = await self.llm.ainvoke(messages)
+                except APITimeoutError:
+                    logger.warning("LLM timed out for %s/%s, retrying with reduced depth", city_name, cat_key)
+                    await asyncio.sleep(5)
+                    # Retry with halved depth
+                    reduced_depth = dict(depth)
+                    reduced_depth[cat_key] = max(depth.get(cat_key, 5) // 2, 2)
+                    prompt = self._build_category_prompt(
+                        city_name, country, days, interests, traveler_type,
+                        cat_key, cat_label, cat_desc,
+                        reduced_depth, currency_code, exchange_rate,
+                        search_context, accumulated,
+                    )
+                    messages = [SystemMessage(content=system), HumanMessage(content=prompt)]
+                    response = await self.llm.ainvoke(messages)
+
+                logger.info(
+                    "LLM category %s complete for %s (chars=%d, est_tokens=%d)",
+                    cat_key, city_name, len(response.content), len(response.content) // 3,
+                )
+
+                # 4. Parse and accumulate
+                parsed = self._parse_json(response.content)
+                if parsed:
+                    items = parsed.get(cat_key, [])
+                    accumulated[cat_key] = items
+                    logger.info("Category %s for %s: %d items", cat_key, city_name, len(items))
+                else:
+                    logger.warning("Failed to parse JSON for category %s/%s", cat_key, city_name)
+
+            except Exception:
+                logger.exception("Category %s failed for %s, continuing", cat_key, city_name)
+                # Continue to next category — partial results preserved
+
+        if not accumulated:
+            return {
+                "response": f"Research for {city_name} failed across all categories. Try `/research {city_name}` again.",
+                "state_updates": {},
+            }
+
+        # Build final research data from accumulated categories
+        research_data = {k: accumulated.get(k, []) for k, _, _ in RESEARCH_CATEGORIES}
+        research_data["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+        # Merge with existing research (append, don't overwrite)
+        existing = dict(state.get("research", {}))
+        if city_name in existing:
+            research_data = self._merge_research(existing[city_name], research_data)
+        existing[city_name] = research_data
+
+        # Count items
+        total = sum(
+            len(research_data.get(k, []))
+            for k in ("places", "activities", "food", "logistics", "tips", "hidden_gems")
         )
 
-        if research_data:
-            research_data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        # Generate a conversational abstract (non-critical — don't lose research on failure)
+        abstract_text = await self._generate_abstract(city_name, traveler_type, days, interests, research_data, total)
 
-            # Merge with existing research (append, don't overwrite)
-            existing = dict(state.get("research", {}))
-            if city_name in existing:
-                research_data = self._merge_research(existing[city_name], research_data)
-            existing[city_name] = research_data
+        summary = (
+            f"**{city_name}** — {total} items found\n\n"
+            f"{abstract_text}\n\n"
+            f"_Say 'tell me more about food' or 'what are the hidden gems?' to go deeper._"
+        )
 
-            # Count items
-            total = sum(
-                len(research_data.get(k, []))
-                for k in ("places", "activities", "food", "logistics", "tips", "hidden_gems")
-            )
-
-            # Generate a conversational abstract (non-critical — don't lose research on failure)
-            abstract_text = await self._generate_abstract(city_name, traveler_type, days, interests, research_data, total)
-
-            summary = (
-                f"**{city_name}** — {total} items found\n\n"
-                f"{abstract_text}\n\n"
-                f"_Say 'tell me more about food' or 'what are the hidden gems?' to go deeper._"
-            )
-
-            return {"response": summary, "state_updates": {"research": existing}}
-
-        # Fallback: parse failed, nothing was saved
-        return {
-            "response": f"I wasn't able to parse the research results for {city_name}. Try `/research {city_name}` again.",
-            "state_updates": {},
-        }
-
-    # Retry schedule: each entry is (depth_divisor, extra_timeout_seconds).
-    # Depth is halved each round; timeout grows exponentially via asyncio.sleep backoff.
-    _RETRY_SCHEDULE = [
-        (1, 0),    # attempt 0: full depth, no extra wait
-        (2, 5),    # attempt 1: half depth, 5s backoff
-        (4, 15),   # attempt 2: quarter depth, 15s backoff
-    ]
-
-    async def _llm_research_with_fallback(
-        self, city_name: str, country: str, days: int,
-        interests: list[str], traveler_type: str,
-        depth: dict[str, int], currency_code: str,
-        exchange_rate, search_context: str, system: str,
-    ) -> dict | None:
-        """Call LLM for city research JSON with exponential backoff and depth reduction.
-
-        Retries up to len(_RETRY_SCHEDULE) times, halving the requested depth and
-        adding an exponentially growing backoff between attempts.  Each individual
-        LLM call still benefits from langchain-anthropic's own max_retries.
-        """
-        from anthropic import APITimeoutError
-
-        last_err: Exception | None = None
-
-        for attempt, (divisor, backoff_s) in enumerate(self._RETRY_SCHEDULE):
-            current_depth = {k: max(v // divisor, 2) for k, v in depth.items()}
-            prompt = self._build_research_prompt(
-                city_name, country, days, interests, traveler_type,
-                current_depth, currency_code, exchange_rate, search_context,
-            )
-            messages = [SystemMessage(content=system), HumanMessage(content=prompt)]
-
-            if attempt == 0:
-                logger.info("LLM synthesis starting: city research for %s (%d days, depth=%s)", city_name, days, current_depth)
-            else:
-                logger.warning(
-                    "LLM retry %d/%d for %s: depth=%s, backoff=%ds",
-                    attempt, len(self._RETRY_SCHEDULE) - 1, city_name, current_depth, backoff_s,
-                )
-                await asyncio.sleep(backoff_s)
-
-            try:
-                response = await self.llm.ainvoke(messages)
-                logger.info(
-                    "LLM synthesis complete: city research for %s (chars=%d, est_tokens=%d, max_tokens=%d, attempt=%d)",
-                    city_name, len(response.content), len(response.content) // 3, self.llm.max_tokens, attempt,
-                )
-                return self._parse_json(response.content)
-            except APITimeoutError as exc:
-                last_err = exc
-                logger.warning("LLM timed out for %s (attempt %d/%d)", city_name, attempt, len(self._RETRY_SCHEDULE) - 1)
-
-        # All retries exhausted
-        raise last_err  # type: ignore[misc]
+        return {"response": summary, "state_updates": {"research": existing}}
 
     @staticmethod
-    def _build_research_prompt(
+    def _build_category_prompt(
         city_name: str, country: str, days: int,
         interests: list[str], traveler_type: str,
+        cat_key: str, cat_label: str, cat_desc: str,
         depth: dict[str, int], currency_code: str,
         exchange_rate, search_context: str,
+        accumulated: dict[str, list],
     ) -> str:
+        """Build a focused prompt for a single research category."""
+        target = depth.get(cat_key, 5)
+
+        # Build iterative context from prior categories
+        prior_context = ""
+        if accumulated:
+            prior_parts = []
+            for k, items in accumulated.items():
+                names = [i.get("name", "?") for i in items[:5]]
+                prior_parts.append(f"  {k}: {len(items)} items (e.g. {', '.join(names)})")
+            prior_context = (
+                "\n\nAlready researched for this city:\n"
+                + "\n".join(prior_parts)
+                + "\nAvoid duplicating these. Cross-reference locations where relevant."
+            )
+
         return (
-            f"Research {city_name}, {country} for a {traveler_type} trip of {days} days.\n"
+            f"Research {cat_label} in {city_name}, {country} for a {traveler_type} trip of {days} days.\n"
+            f"Focus: {cat_desc}\n"
             f"Interests: {', '.join(interests)}\n"
             f"Currency: {currency_code} (1 USD = {exchange_rate} {currency_code})\n"
-            f"Target depth: {depth}\n\n"
+            f"Target: {target} items\n"
+            f"{prior_context}\n\n"
             f"Web search results:\n{search_context}\n\n"
-            "Return a JSON object with keys: places, activities, food, logistics, tips, hidden_gems. "
-            "Each is an array of research items following the schema. "
-            "For each item, include confidence fields: "
-            "source_recency (year string), corroborating_sources (int, how many results mention it), "
-            "review_volume ('high'/'medium'/'low'/'unknown'), "
-            "confidence_score (0.0-1.0 based on recency, corroboration, and review volume). "
+            f'Return a JSON object: {{"{cat_key}": [...]}} where each item follows the ResearchItem schema.\n'
+            "Include confidence fields: source_recency, corroborating_sources, review_volume, confidence_score.\n"
             "Output ONLY valid JSON, no markdown."
         )
 

@@ -373,6 +373,28 @@ class TestOnboardingFlow:
 class TestResearchFlow:
     """Tests for the research agent (TC-RES-*)."""
 
+    @staticmethod
+    def _make_category_mock(category_data: dict | None = None):
+        """Build a mock ainvoke that returns per-category JSON for iterative research.
+
+        ``category_data`` maps category key → list of items.  For any category
+        not present in the mapping, an empty list is returned.
+        """
+        category_data = category_data or {}
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            prompt_text = messages[-1].content if messages else ""
+            # Detect which category is being requested by scanning the prompt
+            from src.agents.research import RESEARCH_CATEGORIES
+            for cat_key, cat_label, _ in RESEARCH_CATEGORIES:
+                if f'"{cat_key}"' in prompt_text or f"Research {cat_label}" in prompt_text:
+                    items = category_data.get(cat_key, [])
+                    return AIMessage(content=json.dumps({cat_key: items}))
+            # Fallback — abstract or destination intel calls
+            return AIMessage(content=json.dumps(category_data) if category_data else "Summary text")
+
+        return mock_ainvoke
+
     @pytest.mark.asyncio
     async def test_research_all_cities(self, japan_state):
         """TC-RES-01: /research all researches all cities (mock LLM)."""
@@ -380,15 +402,13 @@ class TestResearchFlow:
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
 
-        city_research_json = json.dumps({
+        mock_ainvoke = self._make_category_mock({
             "places": [{"id": "test-place-1", "name": "Test Place", "category": "place"}],
-            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
         })
-        mock_response = AIMessage(content=city_research_json)
 
-        with patch.object(type(agent.llm), "ainvoke", new=AsyncMock(return_value=mock_response)):
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
             result = await agent.handle(japan_state, "/research all")
 
         assert "response" in result
@@ -401,15 +421,13 @@ class TestResearchFlow:
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
 
-        city_research_json = json.dumps({
+        mock_ainvoke = self._make_category_mock({
             "places": [{"id": "tokyo-place-1", "name": "Senso-ji", "category": "place"}],
-            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
         })
-        mock_response = AIMessage(content=city_research_json)
 
-        with patch.object(type(agent.llm), "ainvoke", new=AsyncMock(return_value=mock_response)):
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
             result = await agent.handle(japan_state, "/research Tokyo")
 
         assert "response" in result
@@ -446,18 +464,14 @@ class TestResearchFlow:
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
         agent.search_tool.search_destination_intel = AsyncMock()
 
         assert japan_state["destination"].get("researched_at") is not None
 
-        city_json = json.dumps({
-            "places": [], "activities": [], "food": [],
-            "logistics": [], "tips": [], "hidden_gems": [],
-        })
-        mock_response = AIMessage(content=city_json)
+        mock_ainvoke = self._make_category_mock()
 
-        with patch.object(type(agent.llm), "ainvoke", new=AsyncMock(return_value=mock_response)):
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
             result = await agent.handle(japan_state, "/research Tokyo")
 
         agent.search_tool.search_destination_intel.assert_not_called()
@@ -469,22 +483,23 @@ class TestResearchFlow:
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
 
-        good_json = json.dumps({
+        mock_ainvoke = self._make_category_mock({
             "places": [{"id": "test-1", "name": "Good Place", "category": "place"}],
-            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
         })
 
-        call_counter = {"count": 0}
+        city_call_count = {"n": 0}
+        original_research_city = agent._research_city
 
-        async def mock_ainvoke(self_llm, messages, **kwargs):
-            call_counter["count"] += 1
-            if call_counter["count"] == 2:
+        async def mock_research_city(state, city):
+            city_call_count["n"] += 1
+            if city.get("name") == "Kyoto":
                 raise Exception("LLM failure for city 2")
-            return AIMessage(content=good_json)
+            return await original_research_city(state, city)
 
-        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke), \
+             patch.object(agent, "_research_city", side_effect=mock_research_city):
             result = await agent.handle(japan_state, "/research all")
 
         assert "response" in result
@@ -493,27 +508,33 @@ class TestResearchFlow:
 
     @pytest.mark.asyncio
     async def test_research_timeout_retries_with_reduced_depth(self, japan_state):
-        """TC-RES-06: APITimeoutError triggers exponential retry with reduced depth."""
+        """TC-RES-06: Per-category APITimeoutError triggers retry with reduced depth."""
         from anthropic import APITimeoutError
         from src.agents.research import ResearchAgent
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
-
-        city_json = json.dumps({
-            "places": [{"id": "t-1", "name": "Temple", "category": "place"}],
-            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
-        })
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
 
         call_count = {"n": 0}
 
         async def mock_ainvoke(self_llm, messages, **kwargs):
             call_count["n"] += 1
-            # First call (full depth) times out, second call (half depth) succeeds
-            if call_count["n"] == 1:
+            prompt_text = messages[-1].content if messages else ""
+            # First category call (places) times out on first attempt, succeeds on retry
+            if "Places to Visit" in prompt_text and call_count["n"] == 1:
                 raise APITimeoutError(request=MagicMock())
-            return AIMessage(content=city_json)
+            # Detect category from prompt and return appropriate JSON
+            from src.agents.research import RESEARCH_CATEGORIES
+            for cat_key, cat_label, _ in RESEARCH_CATEGORIES:
+                if f"Research {cat_label}" in prompt_text:
+                    if cat_key == "places":
+                        return AIMessage(content=json.dumps({
+                            "places": [{"id": "t-1", "name": "Temple", "category": "place"}]
+                        }))
+                    return AIMessage(content=json.dumps({cat_key: []}))
+            # Abstract call
+            return AIMessage(content="Great research summary")
 
         with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke), \
              patch("src.agents.research.asyncio.sleep", new_callable=AsyncMock):
@@ -521,18 +542,18 @@ class TestResearchFlow:
 
         assert "response" in result
         assert result.get("state_updates", {}).get("research", {}).get("Tokyo") is not None
-        # ainvoke: 1 timeout + 1 research success + 1 abstract = 3
-        assert call_count["n"] == 3
+        research = result["state_updates"]["research"]["Tokyo"]
+        assert len(research["places"]) == 1
 
     @pytest.mark.asyncio
-    async def test_research_timeout_all_retries_exhausted(self, japan_state):
-        """TC-RES-07: All retry attempts timeout — exception propagates to _research_all_cities."""
+    async def test_research_timeout_all_categories_fail_gracefully(self, japan_state):
+        """TC-RES-07: All categories timeout — returns graceful error, no exception."""
         from anthropic import APITimeoutError
-        from src.agents.research import ResearchAgent
+        from src.agents.research import ResearchAgent, RESEARCH_CATEGORIES
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
 
         timeout_count = {"n": 0}
 
@@ -542,35 +563,41 @@ class TestResearchFlow:
 
         with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke_always_timeout), \
              patch("src.agents.research.asyncio.sleep", new_callable=AsyncMock):
-            with pytest.raises(APITimeoutError):
-                await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 4})
+            result = await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 4})
 
-        # Should have tried all 3 attempts (full, half, quarter depth)
-        assert timeout_count["n"] == len(ResearchAgent._RETRY_SCHEDULE)
+        # With iterative flow, all categories fail gracefully — returns error response
+        assert "failed" in result["response"].lower()
+        assert result["state_updates"] == {}
+        # Each category: 1 attempt + 1 retry = 2 calls; 6 categories = 12 total
+        assert timeout_count["n"] == len(RESEARCH_CATEGORIES) * 2
 
     @pytest.mark.asyncio
     async def test_research_abstract_failure_preserves_data(self, japan_state):
         """TC-RES-08: Abstract LLM call fails but research data is still saved."""
-        from src.agents.research import ResearchAgent
+        from src.agents.research import ResearchAgent, RESEARCH_CATEGORIES
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
 
-        city_json = json.dumps({
-            "places": [{"id": "t-1", "name": "Senso-ji", "category": "place"}],
-            "activities": [], "food": [{"id": "f-1", "name": "Ramen", "category": "food"}],
-            "logistics": [], "tips": [], "hidden_gems": [],
-        })
-
-        call_count = {"n": 0}
+        category_call_count = {"n": 0}
 
         async def mock_ainvoke(self_llm, messages, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                # Research LLM call succeeds
-                return AIMessage(content=city_json)
-            # Abstract LLM call fails
+            prompt_text = messages[-1].content if messages else ""
+            # Category calls succeed
+            for cat_key, cat_label, _ in RESEARCH_CATEGORIES:
+                if f"Research {cat_label}" in prompt_text:
+                    category_call_count["n"] += 1
+                    if cat_key == "places":
+                        return AIMessage(content=json.dumps({
+                            "places": [{"id": "t-1", "name": "Senso-ji", "category": "place"}]
+                        }))
+                    elif cat_key == "food":
+                        return AIMessage(content=json.dumps({
+                            "food": [{"id": "f-1", "name": "Ramen", "category": "food"}]
+                        }))
+                    return AIMessage(content=json.dumps({cat_key: []}))
+            # Abstract call fails
             raise Exception("Rate limited")
 
         with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
@@ -581,37 +608,42 @@ class TestResearchFlow:
         research = result["state_updates"]["research"]["Tokyo"]
         assert len(research["places"]) == 1
         assert research["places"][0]["name"] == "Senso-ji"
+        assert len(research["food"]) == 1
+        assert research["food"][0]["name"] == "Ramen"
         # Response should contain fallback abstract
-        assert "Senso-ji" in result["response"] or "2 items" in result["response"]
+        assert "Senso-ji" in result["response"] or "items" in result["response"]
 
     @pytest.mark.asyncio
     async def test_research_all_timeout_skips_and_continues(self, japan_state):
         """TC-RES-09: In /research all, timed-out cities are skipped; others still attempted."""
         from anthropic import APITimeoutError
-        from src.agents.research import ResearchAgent
+        from src.agents.research import ResearchAgent, RESEARCH_CATEGORIES
 
         agent = ResearchAgent()
         agent.search_tool = MagicMock()
-        agent.search_tool.search_city = AsyncMock(return_value=[])
-
-        city_json = json.dumps({
-            "places": [{"id": "t-1", "name": "Temple", "category": "place"}],
-            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
-        })
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
 
         async def mock_ainvoke(self_llm, messages, **kwargs):
-            # Check which city is being researched by scanning the prompt
             prompt_text = messages[-1].content if messages else ""
+            # All Tokyo category calls timeout
             if "Tokyo" in prompt_text:
                 raise APITimeoutError(request=MagicMock())
-            return AIMessage(content=city_json)
+            # Other cities succeed
+            for cat_key, cat_label, _ in RESEARCH_CATEGORIES:
+                if f"Research {cat_label}" in prompt_text:
+                    if cat_key == "places":
+                        return AIMessage(content=json.dumps({
+                            "places": [{"id": "t-1", "name": "Temple", "category": "place"}]
+                        }))
+                    return AIMessage(content=json.dumps({cat_key: []}))
+            return AIMessage(content="Summary text")
 
         with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke), \
              patch("src.agents.research.asyncio.sleep", new_callable=AsyncMock):
             result = await agent.handle(japan_state, "/research all")
 
         response = result["response"]
-        # Tokyo should fail (all retry attempts timeout)
+        # Tokyo should fail (all categories timeout)
         assert "failed" in response.lower() or "⚠️" in response
         # Other cities should have been attempted
         assert "Kyoto" in response or "Osaka" in response
@@ -627,6 +659,164 @@ class TestResearchFlow:
         agent = ResearchAgent()
         assert agent.llm.default_request_timeout == AGENT_TIMEOUTS["research"]
         assert agent.llm.max_retries == AGENT_MAX_RETRIES["research"]
+
+    # ─── New iterative per-category tests ─────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_iterative_research_all_categories(self, japan_state):
+        """TC-RES-ITER-01: Iterative research completes all 6 categories."""
+        from src.agents.research import ResearchAgent, RESEARCH_CATEGORIES
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
+
+        # Each category returns a few items
+        category_items = {
+            "places": [{"id": "p-1", "name": "Temple A", "category": "place"}],
+            "activities": [{"id": "a-1", "name": "Tour B", "category": "activity"}],
+            "food": [{"id": "f-1", "name": "Ramen Shop", "category": "food"}],
+            "logistics": [{"id": "l-1", "name": "Metro Guide", "category": "logistics"}],
+            "tips": [{"id": "t-1", "name": "Money Tip", "category": "tip"}],
+            "hidden_gems": [{"id": "h-1", "name": "Secret Garden", "category": "hidden_gem"}],
+        }
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            prompt_text = messages[-1].content if messages else ""
+            for cat_key, cat_label, _ in RESEARCH_CATEGORIES:
+                if f"Research {cat_label}" in prompt_text:
+                    return AIMessage(content=json.dumps({cat_key: category_items.get(cat_key, [])}))
+            return AIMessage(content="Great finds!")
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
+            result = await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 3})
+
+        assert "Tokyo" in result["state_updates"]["research"]
+        research = result["state_updates"]["research"]["Tokyo"]
+        for cat_key, _, _ in RESEARCH_CATEGORIES:
+            assert cat_key in research, f"Missing category: {cat_key}"
+            assert len(research[cat_key]) == 1, f"Expected 1 item in {cat_key}"
+
+    @pytest.mark.asyncio
+    async def test_iterative_category_failure_preserves_partial(self, japan_state):
+        """TC-RES-ITER-02: Category failure mid-way preserves prior results."""
+        from src.agents.research import ResearchAgent, RESEARCH_CATEGORIES
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            prompt_text = messages[-1].content if messages else ""
+            for cat_key, cat_label, _ in RESEARCH_CATEGORIES:
+                if f"Research {cat_label}" in prompt_text:
+                    if cat_key == "activities":
+                        raise Exception("LLM exploded")
+                    if cat_key == "places":
+                        return AIMessage(content=json.dumps({
+                            "places": [{"id": "p-1", "name": "Temple", "category": "place"}]
+                        }))
+                    if cat_key == "food":
+                        return AIMessage(content=json.dumps({
+                            "food": [{"id": "f-1", "name": "Ramen", "category": "food"}]
+                        }))
+                    return AIMessage(content=json.dumps({cat_key: []}))
+            return AIMessage(content="Summary")
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
+            result = await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 2})
+
+        research = result["state_updates"]["research"]["Tokyo"]
+        # places and food should be saved
+        assert len(research["places"]) == 1
+        assert len(research["food"]) == 1
+        # activities failed — should be empty
+        assert research["activities"] == []
+        # remaining categories should still have been attempted
+        assert "logistics" in research
+        assert "tips" in research
+        assert "hidden_gems" in research
+
+    @pytest.mark.asyncio
+    async def test_iterative_all_categories_fail(self, japan_state):
+        """TC-RES-ITER-03: All categories fail — graceful error response."""
+        from src.agents.research import ResearchAgent
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            raise Exception("Total LLM failure")
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
+            result = await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 2})
+
+        assert "failed" in result["response"].lower()
+        assert result["state_updates"] == {}
+
+    @pytest.mark.asyncio
+    async def test_iterative_context_passed_to_later_categories(self, japan_state):
+        """TC-RES-ITER-04: Later category prompts include prior category context."""
+        from src.agents.research import ResearchAgent, RESEARCH_CATEGORIES
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
+
+        captured_prompts = {}
+
+        async def mock_ainvoke(self_llm, messages, **kwargs):
+            prompt_text = messages[-1].content if messages else ""
+            for cat_key, cat_label, _ in RESEARCH_CATEGORIES:
+                if f"Research {cat_label}" in prompt_text:
+                    captured_prompts[cat_key] = prompt_text
+                    if cat_key == "places":
+                        return AIMessage(content=json.dumps({
+                            "places": [{"id": "p-1", "name": "Grand Palace", "category": "place"},
+                                       {"id": "p-2", "name": "Wat Arun", "category": "place"}]
+                        }))
+                    if cat_key == "activities":
+                        return AIMessage(content=json.dumps({
+                            "activities": [{"id": "a-1", "name": "River Cruise", "category": "activity"}]
+                        }))
+                    return AIMessage(content=json.dumps({cat_key: []}))
+            return AIMessage(content="Summary")
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
+            await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 2})
+
+        # "food" is the 3rd category — should see places and activities in its prompt
+        assert "food" in captured_prompts
+        food_prompt = captured_prompts["food"]
+        assert "Already researched" in food_prompt
+        assert "places" in food_prompt
+        assert "Grand Palace" in food_prompt
+        assert "activities" in food_prompt
+
+    @pytest.mark.asyncio
+    async def test_category_specific_web_search_called(self, japan_state):
+        """TC-RES-ITER-05: search_city_category called with correct category key."""
+        from src.agents.research import ResearchAgent, RESEARCH_CATEGORIES
+
+        agent = ResearchAgent()
+        agent.search_tool = MagicMock()
+        agent.search_tool.search_city_category = AsyncMock(return_value=[])
+
+        mock_ainvoke = self._make_category_mock()
+
+        with patch.object(type(agent.llm), "ainvoke", new=mock_ainvoke):
+            await agent._research_city(japan_state, {"name": "Tokyo", "country": "Japan", "days": 2})
+
+        # search_city_category should have been called once per category
+        assert agent.search_tool.search_city_category.call_count == len(RESEARCH_CATEGORIES)
+        # Verify category keys passed
+        called_categories = [
+            call.kwargs.get("category") or call.args[2]
+            for call in agent.search_tool.search_city_category.call_args_list
+        ]
+        expected_categories = [cat_key for cat_key, _, _ in RESEARCH_CATEGORIES]
+        assert called_categories == expected_categories
 
 
 # =============================================================================
