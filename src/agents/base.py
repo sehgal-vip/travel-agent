@@ -183,7 +183,28 @@ class BaseAgent:
 
         # Orchestrator/onboarding/librarian + pre-onboarding fallback: thin destination context
         dest_context = get_destination_context(state)
-        return f"{base_prompt}\n{dest_context}" if dest_context else base_prompt
+        result = f"{base_prompt}\n{dest_context}" if dest_context else base_prompt
+
+        # Inject user profile if available
+        user_profile = state.get("_user_profile") if state else None
+        if user_profile and any(user_profile.get(k) for k in ("dietary", "pace", "budget_tendency", "interests_history", "visited_countries")):
+            profile_parts = ["\n--- USER PROFILE (cross-trip) ---"]
+            if user_profile.get("dietary"):
+                profile_parts.append(f"Dietary: {', '.join(user_profile['dietary'])}")
+            if user_profile.get("pace"):
+                profile_parts.append(f"Pace preference: {user_profile['pace']}")
+            if user_profile.get("budget_tendency"):
+                profile_parts.append(f"Budget tendency: {user_profile['budget_tendency']}")
+            if user_profile.get("interests_history"):
+                profile_parts.append(f"Past interests: {', '.join(user_profile['interests_history'][:8])}")
+            if user_profile.get("visited_countries"):
+                profile_parts.append(f"Visited: {', '.join(user_profile['visited_countries'])}")
+            if user_profile.get("mobility_notes"):
+                profile_parts.append(f"Mobility: {', '.join(user_profile['mobility_notes'])}")
+            profile_parts.append("--- END USER PROFILE ---")
+            result += "\n".join(profile_parts)
+
+        return result
 
     def get_system_prompt(self, state: TripState | None = None) -> str:
         """Override in subclasses to provide the agent-specific system prompt."""
@@ -193,14 +214,51 @@ class BaseAgent:
         """Bind LangChain tools to the LLM."""
         return self.llm.bind_tools(tools)
 
+    def _compress_history(self, history: list, max_recent: int = 15) -> tuple[str, list]:
+        """Compress older conversation history, keeping recent messages verbatim.
+
+        Returns:
+            (summary, recent_messages) — summary is empty string if no compression needed.
+        """
+        if len(history) <= max_recent:
+            return "", history
+
+        older = history[:-max_recent]
+        recent = history[-max_recent:]
+
+        # Build a simple extractive summary (no LLM call — keep it fast)
+        summary_parts = ["## Conversation Summary (older messages)"]
+
+        # Group by agent
+        agent_topics: dict[str, list[str]] = {}
+        for msg in older:
+            agent = msg.get("agent") or msg.get("role", "user")
+            content = msg.get("content", "")
+            # Extract key info — first sentence or first 100 chars
+            snippet = content.split(".")[0][:100] if content else ""
+            if snippet:
+                agent_topics.setdefault(agent, []).append(snippet)
+
+        for agent, snippets in agent_topics.items():
+            if agent == "user":
+                summary_parts.append(f"- User discussed: {'; '.join(snippets[:5])}")
+            else:
+                summary_parts.append(f"- {agent} covered: {'; '.join(snippets[:3])}")
+
+        summary = "\n".join(summary_parts)
+        return summary, recent
+
     async def invoke(self, state: TripState, user_message: str) -> str:
         """Run a single LLM call with system prompt + conversation context + user message."""
         system_prompt = self.build_system_prompt(state)
         messages = [SystemMessage(content=system_prompt)]
 
-        # Add recent conversation history for context (last 20 messages)
+        # Compressed conversation history
         history = state.get("conversation_history", [])
-        for msg in history[-20:]:
+        summary, recent = self._compress_history(history)
+        if summary:
+            messages.append(HumanMessage(content=f"[Prior conversation summary]\n{summary}"))
+        for msg in recent:
             if msg.get("role") == "user":
                 messages.append(HumanMessage(content=msg["content"]))
             elif msg.get("role") == "assistant":

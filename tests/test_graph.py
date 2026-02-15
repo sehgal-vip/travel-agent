@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.graph import build_graph, route_from_orchestrator
+from src.graph import build_graph, route_from_orchestrator, route_from_specialist, LOOPBACK_AGENTS
 from src.state import TripState
 
 
@@ -18,8 +18,9 @@ class TestGraphCompilation:
     def test_graph_has_all_nodes(self):
         graph = build_graph()
         expected_nodes = {
-            "orchestrator", "onboarding", "research", "librarian",
+            "orchestrator", "onboarding", "research",
             "prioritizer", "planner", "scheduler", "feedback", "cost",
+            "error_handler",
         }
         # LangGraph includes __start__ and __end__ nodes
         node_names = set(graph.nodes.keys())
@@ -34,6 +35,23 @@ class TestGraphCompilation:
         graph = build_graph()
         # The entry point should be orchestrator
         assert "orchestrator" in graph.nodes
+
+    def test_graph_has_error_handler_node(self):
+        graph = build_graph()
+        assert "error_handler" in graph.nodes
+
+    def test_loopback_agents_have_conditional_edges(self):
+        graph = build_graph()
+        # Loopback agents should have conditional edges (not just direct to END)
+        # In LangGraph, conditional edges are stored differently from direct edges.
+        # We verify that each loopback agent has branches (conditional routing).
+        for agent_name in LOOPBACK_AGENTS:
+            assert agent_name in graph.nodes
+            # Check that the agent has conditional edges by looking at the graph's
+            # internal branch data — agents with conditional edges will appear in
+            # the branches dict rather than having a simple edge to __end__.
+            branches = graph.branches.get(agent_name, {})
+            assert len(branches) > 0, f"{agent_name} should have conditional edges but has none"
 
 
 class TestRouting:
@@ -63,10 +81,28 @@ class TestRouting:
         assert route_from_orchestrator(state) == END
 
     def test_all_valid_routes(self):
-        valid = ["onboarding", "research", "librarian", "prioritizer", "planner", "scheduler", "feedback", "cost"]
+        valid = ["onboarding", "research", "prioritizer", "planner", "scheduler", "feedback", "cost", "error_handler"]
         for agent in valid:
             state = {"_next": agent}
             assert route_from_orchestrator(state) == agent
+
+    def test_route_from_specialist_awaiting_input(self):
+        from langgraph.graph import END
+        state = {"_awaiting_input": "research"}
+        assert route_from_specialist(state) == END
+
+    def test_route_from_specialist_delegate(self):
+        state = {"_delegate_to": "planner"}
+        assert route_from_specialist(state) == "planner"
+
+    def test_route_from_specialist_error(self):
+        state = {"_error_agent": "research"}
+        assert route_from_specialist(state) == "error_handler"
+
+    def test_route_from_specialist_normal(self):
+        from langgraph.graph import END
+        state = {}
+        assert route_from_specialist(state) == END
 
 
 class TestStateSchema:
@@ -86,7 +122,7 @@ class TestStateSchema:
     def test_state_accepts_nested_types(self):
         state = TripState(
             trip_id="test",
-            destination={"country": "Japan", "flag_emoji": "🇯🇵"},
+            destination={"country": "Japan", "flag_emoji": "\U0001f1ef\U0001f1f5"},
             cities=[{"name": "Tokyo", "days": 4}],
             messages=[],
         )

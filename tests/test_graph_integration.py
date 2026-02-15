@@ -50,6 +50,14 @@ def _make_state(messages: list[dict] | None = None, **overrides) -> dict:
         "updated_at": "",
         "_next": "",
         "_user_message": "",
+        "_awaiting_input": None,
+        "_callback": None,
+        "_delegate_to": None,
+        "_chain": [],
+        "_routing_echo": "",
+        "_error_agent": None,
+        "_error_context": None,
+        "_loopback_depth": 0,
     }
     state.update(overrides)
     return state
@@ -222,7 +230,6 @@ class TestAllSpecialistRoutes:
     @pytest.mark.parametrize("command,agent_name", [
         ("/start", "onboarding"),
         ("/research", "research"),
-        ("/library", "librarian"),
         ("/priorities", "prioritizer"),
         ("/plan", "planner"),
         ("/agenda", "scheduler"),
@@ -418,3 +425,20 @@ class TestResearchErrorIsolation:
         assert "failed" in response.lower() or "⚠️" in response
         # Response also has Kyoto success
         assert "Kyoto" in response
+
+
+# ─── Test: error_handler_node ────────────────────
+
+
+class TestErrorHandlerNode:
+    @pytest.mark.asyncio
+    async def test_error_handler_returns_message(self):
+        from src.graph import error_handler_node
+        state = _make_state(
+            _error_agent="research",
+            _error_context="LLM timeout",
+        )
+        result = await error_handler_node(state)
+        response = result["messages"][0]["content"]
+        assert "research" in response.lower()
+        assert result["_error_agent"] is None

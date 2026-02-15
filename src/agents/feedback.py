@@ -163,6 +163,31 @@ class FeedbackAgent(BaseAgent):
                         "pending_adjustments": adjustments,
                     }
 
+                # Infer spending from completed activities
+                spending = self._infer_spending(state, feedback_data)
+                if spending and not feedback_data.get("actual_spend_usd"):
+                    # We have cost estimates — ask user to confirm
+                    items_str = ", ".join(
+                        f"{e['name']} (~${e['cost_usd']:.0f})"
+                        for e in spending["items"] if e.get("cost_usd")
+                    )
+                    if items_str:
+                        spending_note = (
+                            f"\n\n💰 Based on what you did today, I'm estimating roughly "
+                            f"${spending['total_usd']:.0f} USD"
+                        )
+                        if spending["total_local"] and spending["currency_code"] != "USD":
+                            spending_note += f" ({spending['currency_symbol']}{spending['total_local']:,.0f} {spending['currency_code']})"
+                        spending_note += f" — that includes {items_str}. Does that sound about right?"
+
+                        # Update the feedback data with estimated spending
+                        feedback_data["estimated_spend_usd"] = spending["total_usd"]
+                        feedback_data["estimated_spend_local"] = spending["total_local"]
+
+                        # Append spending note to response
+                        response_text = (response_text.split("```json")[0].strip() if "```json" in response_text else response_text)
+                        response_text += spending_note
+
                 # Clean response for user
                 clean = response_text.split("```json")[0].strip()
                 if not clean:
@@ -191,3 +216,61 @@ class FeedbackAgent(BaseAgent):
         except (ValueError, json.JSONDecodeError):
             logger.warning("Failed to extract feedback JSON")
             return None
+
+    def _infer_spending(self, state: TripState, feedback_data: dict) -> dict | None:
+        """Infer spending from feedback based on completed activities' research costs.
+
+        Returns spending estimate dict if any costs found, None otherwise.
+        """
+        completed = feedback_data.get("completed_items", [])
+        if not completed:
+            return None
+
+        city = feedback_data.get("city", "")
+        research = state.get("research", {}).get(city, {})
+        dest = state.get("destination", {})
+        currency_symbol = dest.get("currency_symbol", "$")
+        currency_code = dest.get("currency_code", "USD")
+
+        estimates = []
+        total_local = 0
+        total_usd = 0
+
+        # Search through all research categories for matching items
+        for category in ("places", "activities", "food"):
+            for item in research.get(category, []):
+                item_id = item.get("id", "")
+                item_name = (item.get("name") or "").lower()
+
+                # Match by ID or name
+                matched = False
+                for completed_id in completed:
+                    if completed_id == item_id or (item_name and item_name in completed_id.lower()):
+                        matched = True
+                        break
+
+                if matched:
+                    cost_usd = item.get("cost_usd")
+                    cost_local = item.get("cost_local")
+                    if cost_usd or cost_local:
+                        estimates.append({
+                            "name": item.get("name", "Unknown"),
+                            "cost_usd": cost_usd,
+                            "cost_local": cost_local,
+                            "category": category,
+                        })
+                        if cost_usd:
+                            total_usd += cost_usd
+                        if cost_local:
+                            total_local += cost_local
+
+        if not estimates:
+            return None
+
+        return {
+            "items": estimates,
+            "total_usd": total_usd,
+            "total_local": total_local,
+            "currency_symbol": currency_symbol,
+            "currency_code": currency_code,
+        }

@@ -85,10 +85,10 @@ class TestOnboardingAgent:
     def test_step_estimation(self):
         agent = OnboardingAgent()
         state: dict = {"destination": {}, "cities": [], "dates": {}}
-        assert agent._estimate_step(state, "hello", 0) == 1  # increments
+        assert agent._estimate_step(state, "hello", 0) == 0  # stays — destination unfilled
 
         state["destination"] = {"country": "Japan"}
-        assert agent._estimate_step(state, "cities", 0) == 1
+        assert agent._estimate_step(state, "cities", 0) == 1  # jumps to cities
 
         state["cities"] = [{"name": "Tokyo"}]
-        assert agent._estimate_step(state, "dates", 1) == 2
+        assert agent._estimate_step(state, "dates", 1) == 2  # jumps to dates

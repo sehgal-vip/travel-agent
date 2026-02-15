@@ -15,7 +15,22 @@ from src.telegram.formatters import split_message
 logger = logging.getLogger(__name__)
 
 # Internal state keys that should not be persisted to the trip repo
-_INTERNAL_KEYS = {"_next", "_user_message", "messages"}
+_INTERNAL_KEYS = {
+    "_next", "_user_message", "messages", "_awaiting_input", "_callback",
+    "_delegate_to", "_chain", "_routing_echo", "_error_agent", "_error_context",
+    "_loopback_depth",
+}
+
+COMMAND_DISPATCH = {
+    "/start": "onboarding",
+    "/research": "research",
+    "/priorities": "prioritizer",
+    "/plan": "planner",
+    "/agenda": "scheduler",
+    "/feedback": "feedback",
+    "/costs": "cost",
+    "/adjust": "feedback",
+}
 
 
 async def _keep_typing(chat) -> None:
@@ -90,6 +105,56 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 logger.exception("Failed to load prior state for trip %s", trip_id)
 
+        # Pre-graph slash command dispatch (v2)
+        if message_text.startswith("/"):
+            cmd = message_text.split()[0].lower()
+
+            # Direct handlers (skip graph entirely)
+            if cmd == "/status":
+                from src.agents.orchestrator import generate_status
+                status = generate_status(input_state)
+                for part in split_message(status):
+                    await update.message.reply_text(part)
+                return
+            if cmd == "/help":
+                from src.agents.orchestrator import generate_help
+                for part in split_message(generate_help()):
+                    await update.message.reply_text(part)
+                return
+            if cmd == "/library":
+                try:
+                    from src.tools.library_sync import library_sync
+                    sync_result = await library_sync(input_state)
+                    state_to_save = {k: v for k, v in input_state.items() if k not in _INTERNAL_KEYS}
+                    if sync_result.get("library"):
+                        state_to_save["library"] = sync_result["library"]
+                    if repo:
+                        existing = await repo.get_trip(trip_id)
+                        if existing:
+                            await repo.merge_state(trip_id, state_to_save)
+                    for part in split_message(sync_result.get("response", "Library synced.")):
+                        await update.message.reply_text(part)
+                    return
+                except Exception:
+                    logger.exception("Library sync failed")
+                    await update.message.reply_text("Library sync failed. Try again later.")
+                    return
+            if cmd == "/summary":
+                try:
+                    from src.tools.trip_synthesis import synthesize_trip
+                    summary = await synthesize_trip(input_state)
+                    for part in split_message(summary):
+                        await update.message.reply_text(part)
+                    return
+                except Exception:
+                    logger.exception("Trip synthesis failed")
+                    await update.message.reply_text("Could not generate summary. Try /status instead.")
+                    return
+
+            # Pre-set _next for command dispatch
+            if cmd in COMMAND_DISPATCH:
+                input_state["_next"] = COMMAND_DISPATCH[cmd]
+
         logger.info("Invoking graph for thread %s", thread_id)
         result = await graph.ainvoke(input_state, config=config)
         logger.info(
@@ -112,6 +177,17 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 else:
                     await repo.create_trip(trip_id, user_id, state_to_save)
                 logger.info("State saved for trip %s", trip_id)
+
+                # Auto-trigger library_sync for research/planner/feedback
+                responding_agent = result.get("current_agent", "orchestrator")
+                if responding_agent in {"research", "planner", "feedback"}:
+                    try:
+                        from src.tools.library_sync import library_sync
+                        sync_result = await library_sync(state_to_save)
+                        if sync_result.get("library"):
+                            await repo.merge_state(trip_id, {"library": sync_result["library"]})
+                    except Exception:
+                        logger.exception("Auto library sync failed after %s", responding_agent)
 
                 # Update per-agent memory files
                 from src.tools.trip_memory import (

@@ -39,6 +39,8 @@ SCHEDULING PRINCIPLES:
 
 6. **Local phrases** from destination_intel.useful_phrases.
 
+7. **Confidence-aware timing**: If an item has low confidence_score (<0.5), add a note in the tips field like "Verify hours/availability before going." For high confidence items (>0.8), express certainty. Include this context in the tips for each slot.
+
 OUTPUT FORMAT:
 Return a JSON array of DetailedDay objects:
 {
@@ -148,6 +150,13 @@ class SchedulerAgent(BaseAgent):
         # Include recent feedback for adaptive scheduling
         recent_feedback = feedback_log[-2:] if feedback_log else []
 
+        # Drift detection from accumulated feedback
+        drift_context = ""
+        if feedback_log and len(feedback_log) >= 2:
+            from src.tools.drift_detector import detect_drift, format_drift_for_prompt
+            drift = detect_drift(feedback_log)
+            drift_context = format_drift_for_prompt(drift)
+
         prompt = (
             f"Create detailed 2-day agendas for days {', '.join(str(d.get('day', '?')) for d in target_days)}.\n\n"
             f"HIGH-LEVEL PLAN:\n{json.dumps(target_days, indent=2, default=str)}\n\n"
@@ -163,6 +172,9 @@ class SchedulerAgent(BaseAgent):
 
         if recent_feedback:
             prompt += f"RECENT FEEDBACK (adapt schedule accordingly):\n{json.dumps(recent_feedback, indent=2, default=str)}\n\n"
+
+        if drift_context:
+            prompt += f"{drift_context}\n\n"
 
         prompt += "Return JSON array of DetailedDay objects, then a formatted human-readable agenda."
 

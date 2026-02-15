@@ -1,4 +1,4 @@
-"""LangGraph graph definition — orchestrator + 8 specialist agent nodes."""
+"""LangGraph graph definition — orchestrator + 7 specialist agent nodes (v2)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from langgraph.graph import END, StateGraph
+from langgraph.types import Command
 
 from src.agents.base import add_to_conversation_history
 from src.agents.onboarding import OnboardingAgent
@@ -14,6 +15,11 @@ from src.agents.orchestrator import OrchestratorAgent
 from src.state import TripState
 
 logger = logging.getLogger(__name__)
+
+# ─── Agent sets ─────────────────────────────────
+
+SPECIALIST_AGENTS = {"onboarding", "research", "prioritizer", "planner", "scheduler", "feedback", "cost"}
+LOOPBACK_AGENTS = {"research", "planner", "feedback"}  # agents that can loop back to user
 
 # Lazy singletons — instantiated once per process
 _orchestrator = OrchestratorAgent()
@@ -29,9 +35,6 @@ def _get_agent(name: str):
         if name == "research":
             from src.agents.research import ResearchAgent
             _agents[name] = ResearchAgent()
-        elif name == "librarian":
-            from src.agents.librarian import LibrarianAgent
-            _agents[name] = LibrarianAgent()
         elif name == "prioritizer":
             from src.agents.prioritizer import PrioritizerAgent
             _agents[name] = PrioritizerAgent()
@@ -55,6 +58,43 @@ def _get_agent(name: str):
 
 async def orchestrator_node(state: TripState) -> dict:
     """Entry node — routes every message to the correct agent."""
+    # v2: Check graph control keys before normal routing
+    if state.get("_awaiting_input"):
+        # Resuming from a loopback — route back to the agent that requested input
+        target = state["_awaiting_input"]
+        return {
+            "current_agent": target,
+            "_awaiting_input": None,
+            "_next": target,
+        }
+
+    if state.get("_callback"):
+        target = state["_callback"]
+        return {
+            "current_agent": target,
+            "_callback": None,
+            "_next": target,
+        }
+
+    if state.get("_delegate_to"):
+        target = state["_delegate_to"]
+        return {
+            "current_agent": target,
+            "_delegate_to": None,
+            "_next": target,
+        }
+
+    chain = state.get("_chain", [])
+    if chain:
+        target = chain[0]
+        remaining = chain[1:]
+        return {
+            "current_agent": target,
+            "_chain": remaining,
+            "_next": target,
+        }
+
+    # Normal routing
     messages = state.get("messages", [])
     if not messages:
         return {"messages": [{"role": "assistant", "content": "Send /start to begin planning!"}]}
@@ -173,37 +213,56 @@ async def _specialist_node(agent_name: str, state: TripState) -> dict:
         "agent": agent_name,
     })
 
-    return {
+    # Increment loopback depth
+    loopback_depth = state.get("_loopback_depth", 0) + 1
+
+    output = {
         "messages": [{"role": "assistant", "content": response}],
         "conversation_history": history,
         "current_agent": agent_name,
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "_loopback_depth": loopback_depth,
         **updates,
         "_next": END,
     }
 
+    # v2: Check for loopback signals in state_updates
+    if agent_name in LOOPBACK_AGENTS:
+        if updates.get("_awaiting_input"):
+            output["_awaiting_input"] = updates["_awaiting_input"]
+            return Command(update=output, goto="orchestrator")
 
-# Node factory functions for each specialist
-async def research_node(state: TripState) -> dict:
-    return await _specialist_node("research", state)
+        if updates.get("_delegate_to"):
+            delegate_target = updates["_delegate_to"]
+            output["_delegate_to"] = delegate_target
+            return Command(update=output, goto=delegate_target)
 
-async def librarian_node(state: TripState) -> dict:
-    return await _specialist_node("librarian", state)
+        if updates.get("_callback"):
+            output["_callback"] = updates["_callback"]
 
-async def prioritizer_node(state: TripState) -> dict:
-    return await _specialist_node("prioritizer", state)
+    return output
 
-async def planner_node(state: TripState) -> dict:
-    return await _specialist_node("planner", state)
 
-async def scheduler_node(state: TripState) -> dict:
-    return await _specialist_node("scheduler", state)
+async def error_handler_node(state: TripState) -> dict:
+    """Handle errors from specialist agents."""
+    error_agent = state.get("_error_agent", "unknown")
+    error_context = state.get("_error_context", "An error occurred")
+    return {
+        "messages": [{"role": "assistant", "content": f"I ran into an issue with {error_agent}. {error_context} Please try again."}],
+        "_error_agent": None,
+        "_error_context": None,
+        "_next": END,
+    }
 
-async def feedback_node(state: TripState) -> dict:
-    return await _specialist_node("feedback", state)
 
-async def cost_node(state: TripState) -> dict:
-    return await _specialist_node("cost", state)
+# ─── Node factory ───────────────────────────────
+
+
+def _make_specialist_node(name: str):
+    async def node_fn(state: TripState) -> dict:
+        return await _specialist_node(name, state)
+    node_fn.__name__ = f"{name}_node"
+    return node_fn
 
 
 # ─── Routing ─────────────────────────────────────
@@ -214,8 +273,20 @@ def route_from_orchestrator(state: TripState) -> str:
     next_node = state.get("_next", END)
     if next_node == END or next_node == "orchestrator":
         return END
-    valid = {"onboarding", "research", "librarian", "prioritizer", "planner", "scheduler", "feedback", "cost"}
+    valid = {"onboarding", "research", "prioritizer", "planner", "scheduler", "feedback", "cost", "error_handler"}
     return next_node if next_node in valid else END
+
+
+def route_from_specialist(state: TripState) -> str:
+    """Conditional edge for loopback agents — check for delegation / awaiting input."""
+    if state.get("_awaiting_input"):
+        return END  # Wait for next user message
+    if state.get("_delegate_to"):
+        target = state["_delegate_to"]
+        return target if target in SPECIALIST_AGENTS else END
+    if state.get("_error_agent"):
+        return "error_handler"
+    return END
 
 
 # ─── Graph construction ──────────────────────────
@@ -225,16 +296,18 @@ def build_graph(checkpointer=None) -> StateGraph:
     """Build the LangGraph StateGraph with all agent nodes."""
     graph = StateGraph(TripState)
 
-    # Add nodes
+    # Add orchestrator and onboarding nodes
     graph.add_node("orchestrator", orchestrator_node)
     graph.add_node("onboarding", onboarding_node)
-    graph.add_node("research", research_node)
-    graph.add_node("librarian", librarian_node)
-    graph.add_node("prioritizer", prioritizer_node)
-    graph.add_node("planner", planner_node)
-    graph.add_node("scheduler", scheduler_node)
-    graph.add_node("feedback", feedback_node)
-    graph.add_node("cost", cost_node)
+
+    # Add specialist nodes via factory loop
+    for agent_name in SPECIALIST_AGENTS:
+        if agent_name == "onboarding":
+            continue  # already added above
+        graph.add_node(agent_name, _make_specialist_node(agent_name))
+
+    # Add error handler node
+    graph.add_node("error_handler", error_handler_node)
 
     # Entry point
     graph.set_entry_point("orchestrator")
@@ -246,19 +319,38 @@ def build_graph(checkpointer=None) -> StateGraph:
         {
             "onboarding": "onboarding",
             "research": "research",
-            "librarian": "librarian",
             "prioritizer": "prioritizer",
             "planner": "planner",
             "scheduler": "scheduler",
             "feedback": "feedback",
             "cost": "cost",
+            "error_handler": "error_handler",
             END: END,
         },
     )
 
-    # All specialist nodes end after processing
-    for node_name in ("onboarding", "research", "librarian", "prioritizer", "planner", "scheduler", "feedback", "cost"):
-        graph.add_edge(node_name, END)
+    # Onboarding always ends after processing
+    graph.add_edge("onboarding", END)
+
+    # Loopback agents get conditional edges
+    for agent_name in LOOPBACK_AGENTS:
+        graph.add_conditional_edges(
+            agent_name,
+            route_from_specialist,
+            {
+                "error_handler": "error_handler",
+                END: END,
+                **{a: a for a in SPECIALIST_AGENTS if a != "onboarding"},
+            },
+        )
+
+    # Non-loopback specialist agents get direct edge to END
+    non_loopback = SPECIALIST_AGENTS - LOOPBACK_AGENTS - {"onboarding"}
+    for agent_name in non_loopback:
+        graph.add_edge(agent_name, END)
+
+    # Error handler always ends
+    graph.add_edge("error_handler", END)
 
     return graph
 

@@ -178,6 +178,10 @@ class ResearchItem(TypedDict, total=False):
     sources: list[str]
     notes: Optional[str]
     must_try_items: Optional[list[str]]
+    source_recency: Optional[str]        # "2024", "2025", "2026"
+    corroborating_sources: Optional[int]  # Number of sources mentioning this
+    review_volume: Optional[str]          # "high", "medium", "low", "unknown"
+    confidence_score: Optional[float]     # 0.0-1.0
 
 
 class CityResearch(TypedDict, total=False):
@@ -474,3 +478,16 @@ class TripState(TypedDict, total=False):
     # Internal routing (used by graph nodes)
     _next: str
     _user_message: str
+
+    # Graph Control (v2)
+    _awaiting_input: Optional[str]
+    _callback: Optional[str]
+    _delegate_to: Optional[str]
+    _chain: list
+    _routing_echo: str
+    _error_agent: Optional[str]
+    _error_context: Optional[str]
+    _loopback_depth: int
+
+    # Progressive profiling (v2)
+    onboarding_depth: str  # "minimal" | "standard" | "complete"

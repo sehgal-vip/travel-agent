@@ -136,6 +136,10 @@ STEP_FIELD_MAP: list[tuple[int, str, str]] = [
 ]
 
 
+# Minimum viable state — only these 3 are required for onboarding to complete
+MINIMUM_VIABLE_FIELDS = {"destination", "dates", "travelers"}
+
+
 def _fallback_title(dest: dict, cities: list) -> str:
     """Deterministic fallback title when LLM title generation fails."""
     country = dest.get("country", "Adventure")
@@ -150,7 +154,7 @@ def _fallback_title(dest: dict, cities: list) -> str:
 class OnboardingAgent(BaseAgent):
     agent_name = "onboarding"
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state=None) -> str:
         return SYSTEM_PROMPT
 
     async def handle(self, state: TripState, user_message: str) -> dict:
@@ -224,6 +228,24 @@ class OnboardingAgent(BaseAgent):
             if new_step != step:
                 state_updates["onboarding_step"] = new_step
 
+        # Progressive profiling: check minimum viable state
+        if not state.get("onboarding_complete") and not state_updates.get("onboarding_complete"):
+            # Merge any partial state updates into a temporary state for checking
+            check_state = {**state, **state_updates}
+            if self._check_minimum_viable(check_state):
+                depth = self._compute_onboarding_depth(check_state)
+                if depth == "minimal":
+                    # Don't force completion on minimal — let the LLM continue asking
+                    # But if step >= 5 (past travelers), offer early exit
+                    current_step = state_updates.get("onboarding_step", step)
+                    if current_step >= 5:
+                        state_updates["onboarding_complete"] = True
+                        state_updates["onboarding_depth"] = depth
+                        state_updates["onboarding_step"] = current_step
+                elif depth in ("standard", "complete"):
+                    state_updates["onboarding_complete"] = True
+                    state_updates["onboarding_depth"] = depth
+
         # Update conversation history
         updated_history = add_to_conversation_history(state, "user", user_message)
         updated_history = list(updated_history)
@@ -257,6 +279,7 @@ class OnboardingAgent(BaseAgent):
             "trip_id": trip_id,
             "onboarding_complete": True,
             "onboarding_step": 11,
+            "onboarding_depth": "complete",  # Full onboarding completed
             "updated_at": now,
         }
 
@@ -350,6 +373,22 @@ class OnboardingAgent(BaseAgent):
             else:
                 missing.append(label)
         return filled, missing
+
+    def _check_minimum_viable(self, state: TripState) -> bool:
+        """Check if minimum viable state is reached (destination + dates + travelers)."""
+        has_dest = bool(state.get("destination", {}).get("country"))
+        has_dates = bool(state.get("dates", {}).get("start"))
+        has_travelers = bool(state.get("travelers", {}).get("type"))
+        return has_dest and has_dates and has_travelers
+
+    def _compute_onboarding_depth(self, state: TripState) -> str:
+        """Compute onboarding depth based on how many fields are filled."""
+        filled_count = sum(1 for step, _, _ in STEP_FIELD_MAP if self._field_is_filled(state, step))
+        if filled_count >= 10:
+            return "complete"
+        if filled_count >= 6:
+            return "standard"
+        return "minimal"
 
     def _estimate_step(self, state: TripState, message: str, current_step: int) -> int:
         """Jump to the first unfilled step, rather than incrementing by 1."""

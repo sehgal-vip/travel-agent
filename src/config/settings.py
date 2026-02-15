@@ -11,10 +11,12 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str
     TELEGRAM_BOT_TOKEN: str
     TAVILY_API_KEY: str = ""
+    WEATHER_API_KEY: str = ""
+    TRANSIT_API_KEY: str = ""
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/trip_state.db"
     LOG_LEVEL: str = "INFO"
     DEFAULT_MODEL: str = "claude-sonnet-4-5-20250929"
-    PLANNER_MODEL: str = "claude-opus-4-5-20250929"
+    PLANNER_MODEL: str = "claude-opus-4-6"
 
     LLM_TIMEOUT: float = 120.0
     LLM_MAX_RETRIES: int = 1
@@ -23,9 +25,8 @@ class Settings(BaseSettings):
         "orchestrator": "claude-sonnet-4-5-20250929",
         "onboarding": "claude-sonnet-4-5-20250929",
         "research": "claude-sonnet-4-5-20250929",
-        "librarian": "claude-sonnet-4-5-20250929",
         "prioritizer": "claude-sonnet-4-5-20250929",
-        "planner": "claude-opus-4-5-20250929",
+        "planner": "claude-opus-4-6",
         "scheduler": "claude-sonnet-4-5-20250929",
         "feedback": "claude-sonnet-4-5-20250929",
         "cost": "claude-sonnet-4-5-20250929",

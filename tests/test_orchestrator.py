@@ -16,7 +16,7 @@ class TestCommandMap:
     """Verify all expected commands are mapped."""
 
     def test_all_commands_present(self):
-        expected = {"/start", "/research", "/library", "/priorities", "/plan", "/agenda", "/feedback", "/costs", "/adjust", "/status", "/help", "/trips", "/mytrips", "/trip", "/join"}
+        expected = {"/start", "/research", "/priorities", "/plan", "/agenda", "/feedback", "/costs", "/adjust", "/status", "/help", "/trips", "/mytrips", "/trip", "/join"}
         assert expected == set(COMMAND_MAP.keys())
 
     def test_start_routes_to_onboarding(self):
@@ -39,12 +39,11 @@ class TestPrerequisiteGuards:
         assert result is not None
         assert "research" in result.lower()
 
-    def test_blocks_planner_without_priorities(self, japan_state):
+    def test_allows_planner_without_priorities(self, japan_state):
         japan_state["research"] = {"Tokyo": {"places": [], "food": []}}
         orch = OrchestratorAgent()
         result = orch._check_prerequisites(japan_state, "planner")
-        assert result is not None
-        assert "priorities" in result.lower() or "priorit" in result.lower()
+        assert result is None
 
     def test_allows_research_after_onboarding(self, japan_state):
         orch = OrchestratorAgent()
@@ -128,11 +127,15 @@ class TestCommandRouting:
         assert "welcome" in result.get("response", "").lower() or "get started" in result.get("response", "").lower()
 
     @pytest.mark.asyncio
-    async def test_start_after_onboarding_complete_returns_guard(self, japan_state):
-        orch = OrchestratorAgent()
-        result = await orch.route(japan_state, "/start")
+    async def test_start_after_onboarding_complete_returns_welcome_back(self, japan_state):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        mock_response = MagicMock()
+        mock_response.content = "Welcome back to your Japan trip!"
+        with patch("langchain_anthropic.ChatAnthropic.ainvoke", new_callable=AsyncMock, return_value=mock_response):
+            orch = OrchestratorAgent()
+            result = await orch.route(japan_state, "/start")
         assert result["target_agent"] == "orchestrator"
-        assert "/trip new" in result.get("response", "")
+        assert "Ramen & Temples Run" in result.get("response", "")
 
     @pytest.mark.asyncio
     async def test_status_returns_direct_response(self, japan_state):
@@ -189,3 +192,40 @@ class TestStateAwareClassification:
         orch = OrchestratorAgent()
         summary = orch._get_state_summary(empty_state)
         assert "in progress" in summary
+
+
+class TestLoopbackRouting:
+    """Test v2 loopback routing priorities."""
+
+    @pytest.mark.asyncio
+    async def test_awaiting_input_takes_priority(self, japan_state):
+        orch = OrchestratorAgent()
+        state = dict(japan_state)
+        state["_awaiting_input"] = "research"
+        result = await orch.route(state, "yes I want more details")
+        assert result["target_agent"] == "research"
+
+    @pytest.mark.asyncio
+    async def test_callback_routing(self, japan_state):
+        orch = OrchestratorAgent()
+        state = dict(japan_state)
+        state["_callback"] = "planner"
+        result = await orch.route(state, "here's the budget info")
+        assert result["target_agent"] == "planner"
+
+    @pytest.mark.asyncio
+    async def test_delegate_routing(self, japan_state):
+        orch = OrchestratorAgent()
+        state = dict(japan_state)
+        state["_delegate_to"] = "cost"
+        result = await orch.route(state, "checking costs")
+        assert result["target_agent"] == "cost"
+
+    @pytest.mark.asyncio
+    async def test_loopback_depth_enforcement(self, japan_state):
+        orch = OrchestratorAgent()
+        state = dict(japan_state)
+        state["_loopback_depth"] = 6
+        result = await orch.route(state, "anything")
+        assert result["target_agent"] == "orchestrator"
+        assert "reset" in result.get("response", "").lower() or "back and forth" in result.get("response", "").lower()

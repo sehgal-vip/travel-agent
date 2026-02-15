@@ -36,7 +36,7 @@ def create_bot(graph, repo) -> Application:
     commands = [
         "start", "research", "library", "priorities", "plan",
         "agenda", "feedback", "costs", "adjust", "status",
-        "help", "trips", "mytrips", "trip", "join",
+        "help", "trips", "mytrips", "trip", "join", "summary",
     ]
     for cmd in commands:
         app.add_handler(CommandHandler(cmd, process_message))
@@ -46,6 +46,12 @@ def create_bot(graph, repo) -> Application:
 
     # Plain text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
+
+    # Register proactive nudge job (runs every 6 hours)
+    if app.job_queue is not None:
+        from src.telegram.nudge import nudge_check
+        app.job_queue.run_repeating(nudge_check, interval=21600, first=60)
+        logger.info("Proactive nudge job registered (6h interval).")
 
     logger.info("Telegram bot configured with %d command handlers.", len(commands))
     return app

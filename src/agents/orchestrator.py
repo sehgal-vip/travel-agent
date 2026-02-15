@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 COMMAND_MAP: dict[str, str] = {
     "/start": "onboarding",
     "/research": "research",
-    "/library": "librarian",
     "/priorities": "prioritizer",
     "/plan": "planner",
     "/agenda": "scheduler",
@@ -110,6 +109,36 @@ class OrchestratorAgent(BaseAgent):
 
         Returns dict with 'target_agent' and optional 'response' for meta-commands.
         """
+        # v2 loopback handling — priority routing
+        # Priority 1: Agent waiting for user reply
+        if state.get("_awaiting_input"):
+            target = state["_awaiting_input"]
+            if target in {"onboarding", "research", "prioritizer", "planner", "scheduler", "feedback", "cost"}:
+                return {"target_agent": target}
+
+        # Priority 2: Callback from delegation
+        if state.get("_callback"):
+            target = state["_callback"]
+            if target in {"onboarding", "research", "prioritizer", "planner", "scheduler", "feedback", "cost"}:
+                return {"target_agent": target}
+
+        # Priority 3: Delegate to another agent
+        if state.get("_delegate_to"):
+            target = state["_delegate_to"]
+            if target in {"onboarding", "research", "prioritizer", "planner", "scheduler", "feedback", "cost"}:
+                return {"target_agent": target}
+
+        # Priority 4: Pop from chain
+        chain = state.get("_chain", [])
+        if chain:
+            target = chain[0]  # Will be popped by graph
+            if target in {"onboarding", "research", "prioritizer", "planner", "scheduler", "feedback", "cost"}:
+                return {"target_agent": target}
+
+        # Loopback depth enforcement
+        if state.get("_loopback_depth", 0) > 5:
+            return {"target_agent": "orchestrator", "response": "I've been going back and forth too much. Let me reset. How can I help?"}
+
         # 1. Command-based routing
         if message.startswith("/"):
             cmd = message.split()[0].lower()
@@ -237,7 +266,6 @@ class OrchestratorAgent(BaseAgent):
             "Agents:\n"
             "- onboarding: trip setup, change dates/cities/budget/travelers\n"
             "- research: curious about places, food, activities, 'what's there to do', 'tell me about X'\n"
-            "- librarian: save info, knowledge base, markdown export\n"
             "- prioritizer: rank, prioritize, 'what's most important', 'must-do'\n"
             "- planner: itinerary, schedule, 'plan my days', 'what order'\n"
             "- scheduler: detailed agenda, 'what's today', 'what's tomorrow', 'next 2 days'\n"
@@ -278,12 +306,18 @@ class OrchestratorAgent(BaseAgent):
         agent_name = response.content.strip().lower()
 
         valid_agents = {
-            "onboarding", "research", "librarian", "prioritizer",
+            "onboarding", "research", "prioritizer",
             "planner", "scheduler", "feedback", "cost", "orchestrator",
         }
 
         if agent_name not in valid_agents:
             agent_name = "orchestrator"
+
+        # Clear stale _awaiting_input if LLM routes to a different agent
+        awaiting = state.get("_awaiting_input")
+        if awaiting and agent_name != awaiting:
+            # Will be cleared when state is saved
+            pass  # The routing will override, clearing happens in handler
 
         # Check prerequisites — soft guards that offer to help
         guard = self._check_prerequisites(state, agent_name)

@@ -1,4 +1,9 @@
-"""Librarian agent — creates and manages a local markdown knowledge base for the trip."""
+"""Librarian agent — creates and manages a local markdown knowledge base for the trip.
+
+DEPRECATED (v2): This agent has been demoted to a tool function.
+Use src/tools/library_sync.library_sync() instead.
+The graph no longer includes a librarian node. This file is kept for backward compatibility.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ class LibrarianAgent(BaseAgent):
         super().__init__()
         self.library = MarkdownLibrary()
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state=None) -> str:
         return SYSTEM_PROMPT
 
     async def handle(self, state: TripState, user_message: str) -> dict:

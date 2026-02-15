@@ -57,6 +57,8 @@ PLANNING PRINCIPLES:
 
 10. **Day-of-week**: Museums close Mondays (many countries). Markets may be weekly.
 
+11. **Confidence-aware**: When referencing items with low confidence_score (<0.5), add qualifying language like "worth checking if it's still open." Items with high confidence (>0.8) can be stated definitively.
+
 OUTPUT FORMAT:
 Return a JSON array of DayPlan objects, then a human-readable summary.
 Each DayPlan:
@@ -96,6 +98,30 @@ class PlannerAgent(BaseAgent):
                 }
             priorities = self._auto_prioritize(state)
             auto_prioritized = True
+
+        # Check if resuming from conflict negotiation
+        scratch = state.get("agent_scratch", {})
+        if scratch.get("draft_plan") and scratch.get("plan_conflicts"):
+            # User responded to conflict prompt — finalize the plan
+            draft_plan = scratch["draft_plan"]
+            version = (state.get("plan_version") or 0) + 1
+            # Mark conflicts as acknowledged and proceed with the draft
+            state_updates = {
+                "high_level_plan": draft_plan,
+                "plan_status": "draft",
+                "plan_version": version,
+                "_awaiting_input": None,
+                "agent_scratch": {
+                    k: v for k, v in scratch.items()
+                    if k not in ("draft_plan", "plan_conflicts")
+                },
+            }
+            if auto_prioritized:
+                state_updates["priorities"] = priorities
+            return {
+                "response": f"Got it! Plan locked in (v{version}). Review above and say 'approved' to finalize, or tell me what to change.",
+                "state_updates": state_updates,
+            }
 
         cities = state.get("cities", [])
         dates = state.get("dates", {})
@@ -169,6 +195,34 @@ class PlannerAgent(BaseAgent):
         plan_data = self._parse_plan(response_text)
 
         if plan_data:
+            # Check for time conflicts
+            conflicts = self._detect_conflicts(plan_data, priorities)
+            if conflicts and not state.get("agent_scratch", {}).get("plan_conflicts_acknowledged"):
+                conflict_msgs = []
+                for c in conflicts:
+                    conflict_msgs.append(
+                        f"Day {c['day']} ({c['city']}): {c['must_do_count']} must-dos "
+                        f"but realistically time for {c['max_recommended']}. "
+                        f"Items: {', '.join(c['items'][:6])}"
+                    )
+
+                return {
+                    "response": (
+                        "I've drafted a plan, but spotted some tight spots:\n\n"
+                        + "\n".join(f"⚠️ {m}" for m in conflict_msgs)
+                        + "\n\nWhich must-dos matter most to you? I can move others to nearby days "
+                        "or mark them as nice-to-have. Or say 'keep it packed' if you want to try fitting everything!"
+                    ),
+                    "state_updates": {
+                        "_awaiting_input": "planner",
+                        "agent_scratch": {
+                            **(state.get("agent_scratch") or {}),
+                            "draft_plan": plan_data,
+                            "plan_conflicts": conflicts,
+                        },
+                    },
+                }
+
             version = (state.get("plan_version") or 0) + 1
 
             # Build readable summary
@@ -211,6 +265,17 @@ class PlannerAgent(BaseAgent):
             if auto_prioritized:
                 state_updates["priorities"] = priorities
 
+            # Check if we should get budget targets from cost agent
+            scratch = state.get("agent_scratch", {})
+            if self._needs_budget_check(state) and not scratch.get("budget_checked"):
+                state_updates["_delegate_to"] = "cost"
+                state_updates["_callback"] = "planner"
+                state_updates["agent_scratch"] = {
+                    **(state.get("agent_scratch") or {}),
+                    "pending_plan": plan_data,
+                    "budget_checked": True,
+                }
+
             return {
                 "response": "\n".join(summary_parts),
                 "state_updates": state_updates,
@@ -221,6 +286,34 @@ class PlannerAgent(BaseAgent):
             "response": "I generated a plan but couldn't parse it properly. Try /plan again.",
             "state_updates": {},
         }
+
+    def _detect_conflicts(self, plan_data: list, priorities: dict) -> list[dict]:
+        """Detect time conflicts in the generated plan.
+
+        Returns list of conflict dicts if problems found, empty list if OK.
+        """
+        conflicts = []
+        for day in plan_data:
+            activities = day.get("key_activities", [])
+            must_dos = [a for a in activities if a.get("tier") == "must_do"]
+            if len(must_dos) > 4:
+                conflicts.append({
+                    "day": day.get("day"),
+                    "city": day.get("city"),
+                    "must_do_count": len(must_dos),
+                    "max_recommended": 4,
+                    "items": [a.get("name") for a in must_dos],
+                })
+        return conflicts
+
+    def _needs_budget_check(self, state: TripState) -> bool:
+        """Check if we should delegate to cost agent for budget targets."""
+        budget = state.get("budget", {})
+        cost_tracker = state.get("cost_tracker", {})
+        # Delegate if budget is set but no daily target exists
+        if budget.get("total_estimate_usd") and not cost_tracker.get("budget_daily_target_usd"):
+            return True
+        return False
 
     def _auto_prioritize(self, state: TripState) -> dict[str, list[dict]]:
         """Auto-generate priorities from research data when explicit priorities are missing."""

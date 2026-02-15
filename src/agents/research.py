@@ -128,6 +128,18 @@ class ResearchAgent(BaseAgent):
                 target_city = city
                 break
 
+        # Check if resuming from clarification
+        scratch = state.get("agent_scratch", {})
+        if scratch.get("research_context"):
+            # User responded to clarification, resume with enriched context
+            target_city = scratch["research_context"].get("target_city")
+            if target_city:
+                # Find the city config
+                for city in cities:
+                    if city.get("name") == target_city:
+                        target_city = city
+                        break
+
         if not target_city and cities:
             # Research the first unresearched city
             researched = state.get("research", {})
@@ -137,6 +149,22 @@ class ResearchAgent(BaseAgent):
                     break
             if not target_city:
                 target_city = cities[0]
+
+        if target_city and self._needs_clarification(state):
+            return {
+                "response": (
+                    f"Before I dig into {target_city.get('name', '')}, it'd help to know what you're most excited about! "
+                    "Are you more into food, history, nightlife, nature, hidden local spots, or something else? "
+                    "This helps me find the really good stuff, not just the tourist hits."
+                ),
+                "state_updates": {
+                    "_awaiting_input": "research",
+                    "agent_scratch": {
+                        **(state.get("agent_scratch") or {}),
+                        "research_context": {"target_city": target_city.get("name", "")},
+                    },
+                },
+            }
 
         if target_city:
             return await self._research_city(state, target_city)
@@ -241,6 +269,14 @@ class ResearchAgent(BaseAgent):
         traveler_type = state.get("travelers", {}).get("type", "")
         depth = _get_research_depth(days)
 
+        # Check freshness of existing research
+        freshness = self._check_freshness(state, city_name)
+        if freshness and freshness["status"] == "very_stale":
+            logger.info("Research for %s is very stale (%d days old), doing full refresh", city_name, freshness["age_days"])
+        elif freshness and freshness["status"] == "stale":
+            logger.info("Research for %s is stale (%d days old, trip in %s days), refreshing",
+                        city_name, freshness["age_days"], freshness.get("days_until_trip"))
+
         # Web search
         search_results = await self.search_tool.search_city(
             city_name, country, interests, traveler_type
@@ -262,6 +298,10 @@ class ResearchAgent(BaseAgent):
             f"Web search results:\n{search_context}\n\n"
             "Return a JSON object with keys: places, activities, food, logistics, tips, hidden_gems. "
             "Each is an array of research items following the schema. "
+            "For each item, include confidence fields: "
+            "source_recency (year string), corroborating_sources (int, how many results mention it), "
+            "review_volume ('high'/'medium'/'low'/'unknown'), "
+            "confidence_score (0.0-1.0 based on recency, corroboration, and review volume). "
             "Output ONLY valid JSON, no markdown."
         )
 
@@ -377,6 +417,65 @@ class ResearchAgent(BaseAgent):
         )
 
         return {"response": "\n\n".join(messages_parts), "state_updates": updates}
+
+    def _needs_clarification(self, state: TripState) -> bool:
+        """Check if interests are too vague for targeted research."""
+        interests = state.get("interests", [])
+        if not interests:
+            return True
+        vague = {"sightseeing", "general", "everything", "all", "tourism", "tourist"}
+        return all(i.lower() in vague for i in interests)
+
+    def _check_freshness(self, state: TripState, city_name: str) -> dict | None:
+        """Check if research for a city is stale and needs refresh.
+
+        Returns a dict with freshness info if stale, None if fresh.
+        """
+        research = state.get("research", {})
+        city_data = research.get(city_name)
+        if not city_data:
+            return None
+
+        last_updated = city_data.get("last_updated")
+        if not last_updated:
+            return None
+
+        try:
+            updated_dt = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
+        now = datetime.now(timezone.utc)
+        age_days = (now - updated_dt).days
+
+        # Check trip proximity
+        dates = state.get("dates", {})
+        trip_start = dates.get("start", "")
+        days_until_trip = None
+        if trip_start:
+            try:
+                trip_dt = datetime.fromisoformat(trip_start + "T00:00:00+00:00")
+                days_until_trip = (trip_dt - now).days
+            except ValueError:
+                pass
+
+        if age_days > 14 and (days_until_trip is not None and days_until_trip < 30):
+            return {
+                "age_days": age_days,
+                "days_until_trip": days_until_trip,
+                "status": "stale",
+                "recommendation": "refresh",
+            }
+
+        if age_days > 30:
+            return {
+                "age_days": age_days,
+                "days_until_trip": days_until_trip,
+                "status": "very_stale",
+                "recommendation": "full_refresh",
+            }
+
+        return None
 
     def _merge_research(self, existing: dict, new: dict) -> dict:
         """Merge new research into existing, deduplicating by name."""

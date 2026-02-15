@@ -264,14 +264,15 @@ class TestOnboardingFlow:
         assert result == 2
 
     def test_step_advances_with_dates(self, empty_state):
-        """TC-ONB-03: Step advances when dates provided (step 2 -> 3)."""
+        """TC-ONB-03: Step advances when dates provided — jumps to first unfilled."""
         agent = OnboardingAgent()
         state = dict(empty_state)
         state["destination"] = {"country": "Japan"}
         state["cities"] = [{"name": "Tokyo", "country": "Japan", "days": 4, "order": 1}]
         state["dates"] = {"start": "2026-04-01", "end": "2026-04-14", "total_days": 14}
         result = agent._estimate_step(state, "April 1 to April 14", 2)
-        assert result == 3
+        # Steps 0-3 are all filled (cities have days), so jumps past step 3
+        assert result >= 3
 
     def test_confirmation_with_valid_json_completes_onboarding(self):
         """TC-ONB-04: Confirmation with valid JSON sets onboarding_complete=True."""
@@ -646,15 +647,39 @@ class TestPlannerFlow:
     """Tests for the planner agent (TC-PLN-*)."""
 
     @pytest.mark.asyncio
-    async def test_no_priorities_returns_error(self, japan_state):
-        """TC-PLN-05: No priorities returns error message."""
+    async def test_auto_prioritizes_when_priorities_missing(self, japan_state):
+        """TC-PLN-05: No priorities auto-generates them and creates plan."""
         from src.agents.planner import PlannerAgent
 
         agent = PlannerAgent()
         state = dict(japan_state)
         state["priorities"] = {}
+        state["research"] = {"Tokyo": SAMPLE_RESEARCH_TOKYO}
+
+        plan_json = json.dumps(SAMPLE_DAY_PLAN)
+        mock_response = AIMessage(content=plan_json)
+
+        with patch.object(type(agent.llm), "ainvoke", new=AsyncMock(return_value=mock_response)):
+            result = await agent.handle(state, "/plan")
+
+        assert "state_updates" in result
+        assert "high_level_plan" in result["state_updates"]
+        assert "priorities" in result["state_updates"]
+        priorities = result["state_updates"]["priorities"]
+        assert "Tokyo" in priorities
+        assert len(priorities["Tokyo"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_no_research_returns_error(self, japan_state):
+        """TC-PLN-06: No research returns error message."""
+        from src.agents.planner import PlannerAgent
+
+        agent = PlannerAgent()
+        state = dict(japan_state)
+        state["priorities"] = {}
+        state["research"] = {}
         result = await agent.handle(state, "/plan")
-        assert "priorities" in result["response"].lower()
+        assert "research" in result["response"].lower()
         assert result["state_updates"] == {}
 
     @pytest.mark.asyncio
@@ -1432,8 +1457,12 @@ class TestErrorHandling:
         assert len(assistant_msgs) > 0
 
     def test_state_save_filters_internal_keys(self):
-        """TC-ERR-03: State save filtered (no _next, _user_message, messages)."""
-        assert _INTERNAL_KEYS == {"_next", "_user_message", "messages"}
+        """TC-ERR-03: State save filtered (no _next, _user_message, messages, and v2 control keys)."""
+        assert _INTERNAL_KEYS == {
+            "_next", "_user_message", "messages", "_awaiting_input", "_callback",
+            "_delegate_to", "_chain", "_routing_echo", "_error_agent", "_error_context",
+            "_loopback_depth",
+        }
 
         result = {
             "_next": "research",
@@ -1487,8 +1516,8 @@ class TestGraphRouting:
 
     def test_route_from_orchestrator_valid_nodes(self):
         """Valid _next values route to the correct node."""
-        for node in ("onboarding", "research", "librarian", "prioritizer",
-                      "planner", "scheduler", "feedback", "cost"):
+        for node in ("onboarding", "research", "prioritizer",
+                      "planner", "scheduler", "feedback", "cost", "error_handler"):
             state = {"_next": node}
             assert route_from_orchestrator(state) == node
 
@@ -1641,7 +1670,6 @@ class TestCommandMapAndPrerequisites:
         assert "/agenda" in COMMAND_MAP
         assert "/feedback" in COMMAND_MAP
         assert "/costs" in COMMAND_MAP
-        assert "/library" in COMMAND_MAP
         assert "/status" in COMMAND_MAP
         assert "/help" in COMMAND_MAP
         assert "/join" in COMMAND_MAP
@@ -1659,7 +1687,7 @@ class TestCommandMapAndPrerequisites:
 
         plan_fields = [field for field, _ in PREREQUISITES["planner"]]
         assert "research" in plan_fields
-        assert "priorities" in plan_fields
+        assert "priorities" not in plan_fields
 
         sched_fields = [field for field, _ in PREREQUISITES["scheduler"]]
         assert "high_level_plan" in sched_fields
@@ -1678,13 +1706,16 @@ class TestUXAuditAdditions:
     """Tests for UX audit fixes."""
 
     @pytest.mark.asyncio
-    async def test_start_after_onboarding_complete_returns_guard(self, japan_state):
-        """H3: /start after onboarding returns guard message."""
-        orch = OrchestratorAgent()
-        result = await orch.route(japan_state, "/start")
+    async def test_start_after_onboarding_complete_returns_welcome_back(self, japan_state):
+        """H3: /start after onboarding returns welcome-back with trip summary."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        mock_response = MagicMock()
+        mock_response.content = "Welcome back! Let's keep planning your Japan adventure."
+        with patch("langchain_anthropic.ChatAnthropic.ainvoke", new_callable=AsyncMock, return_value=mock_response):
+            orch = OrchestratorAgent()
+            result = await orch.route(japan_state, "/start")
         assert result["target_agent"] == "orchestrator"
-        assert "/trip new" in result["response"]
-        assert "/status" in result["response"]
+        assert "Ramen & Temples Run" in result["response"]
 
     def test_status_includes_next_step(self, japan_state):
         """H4: Status includes next-step suggestion."""
@@ -1692,12 +1723,12 @@ class TestUXAuditAdditions:
         assert "👉" in status
         assert "/research all" in status
 
-    def test_status_includes_next_step_priorities(self, japan_state):
-        """H4: Status suggests /priorities when research done."""
+    def test_status_includes_next_step_plan_after_research(self, japan_state):
+        """H4: Status suggests /plan when research done (priorities optional)."""
         state = dict(japan_state)
         state["research"] = {"Tokyo": {}, "Kyoto": {}, "Osaka": {}}
         status = generate_status(state)
-        assert "/priorities" in status
+        assert "/plan" in status
 
     def test_status_includes_next_step_plan(self, japan_state):
         """H4: Status suggests /plan when priorities done."""
@@ -1790,3 +1821,183 @@ class TestConversationHistory:
         assert history[0]["content"] == "old msg"
         assert history[1]["content"] == "new msg"
         assert history[1]["agent"] == "orchestrator"
+
+
+# =============================================================================
+# CONVERSATIONAL ONBOARDING TESTS
+# =============================================================================
+
+
+class TestConversationalOnboarding:
+    """Tests for conversational onboarding improvements (skip-aware step logic)."""
+
+    def test_estimate_step_jumps_when_multiple_filled(self, empty_state):
+        """If destination+cities+dates are filled, step jumps past them."""
+        agent = OnboardingAgent.__new__(OnboardingAgent)
+        state = dict(empty_state)
+        state["destination"] = {"country": "Japan"}
+        state["cities"] = [{"name": "Tokyo", "country": "Japan", "days": 4, "order": 1}]
+        state["dates"] = {"start": "2026-04-01", "end": "2026-04-14", "total_days": 14}
+        new_step = agent._estimate_step(state, "anything", 0)
+        assert new_step >= 3
+
+    def test_estimate_step_jumps_to_first_unfilled(self, empty_state):
+        """Step jumps to the first unfilled field, skipping filled ones."""
+        agent = OnboardingAgent.__new__(OnboardingAgent)
+        state = dict(empty_state)
+        state["destination"] = {"country": "Japan"}
+        state["cities"] = [{"name": "Tokyo", "country": "Japan", "days": 4, "order": 1}]
+        state["dates"] = {"start": "2026-04-01", "end": "2026-04-14", "total_days": 14}
+        state["travelers"] = {"count": 2, "type": "couple", "dietary": [], "accessibility": []}
+        state["budget"] = {"style": "midrange", "total_estimate_usd": 4000}
+        state["interests"] = ["food", "culture"]
+        state["must_dos"] = None  # not yet asked
+        state["accommodation_pref"] = ""
+        state["transport_pref"] = []
+        # Steps 0-7 are filled, step 8 (must_dos=None) is the first unfilled
+        new_step = agent._estimate_step(state, "anything", 0)
+        assert new_step == 8
+
+    def test_estimate_step_returns_10_when_all_filled(self, japan_state):
+        """When all fields are filled, returns 10 (summary/confirmation)."""
+        agent = OnboardingAgent.__new__(OnboardingAgent)
+        state = dict(japan_state)
+        new_step = agent._estimate_step(state, "anything", 0)
+        assert new_step == 10
+
+    def test_filled_and_missing_categorization(self, empty_state):
+        """Fields with data show as filled, empty fields as missing."""
+        agent = OnboardingAgent.__new__(OnboardingAgent)
+        state = dict(empty_state)
+        state["destination"] = {"country": "Japan"}
+        state["cities"] = [{"name": "Tokyo", "country": "Japan", "days": 4, "order": 1}]
+        filled, missing = agent._compute_filled_and_missing(state)
+        assert "Destination" in filled
+        assert "Cities" in filled
+        assert "Days per city" in filled
+        assert "Budget" in missing
+        assert "Interests" in missing
+        assert "Transport" in missing
+
+    def test_filled_and_missing_all_filled(self, japan_state):
+        """Fully onboarded state has all fields filled, none missing."""
+        agent = OnboardingAgent.__new__(OnboardingAgent)
+        state = dict(japan_state)
+        filled, missing = agent._compute_filled_and_missing(state)
+        assert len(missing) == 0
+        assert len(filled) == 11
+
+    def test_field_is_filled_checks_days_per_city(self, empty_state):
+        """Step 3 (days per city) checks that all cities have 'days' key."""
+        agent = OnboardingAgent.__new__(OnboardingAgent)
+        state = dict(empty_state)
+        state["cities"] = [{"name": "Tokyo", "country": "Japan"}]  # no 'days'
+        assert agent._field_is_filled(state, 3) is False
+        state["cities"] = [{"name": "Tokyo", "country": "Japan", "days": 4}]
+        assert agent._field_is_filled(state, 3) is True
+
+    def test_field_is_filled_checks_dietary_accessibility(self, empty_state):
+        """Step 7 checks that dietary AND accessibility keys exist."""
+        agent = OnboardingAgent.__new__(OnboardingAgent)
+        state = dict(empty_state)
+        state["travelers"] = {"type": "couple", "count": 2}
+        assert agent._field_is_filled(state, 7) is False
+        state["travelers"] = {"type": "couple", "count": 2, "dietary": [], "accessibility": []}
+        assert agent._field_is_filled(state, 7) is True
+
+
+# =============================================================================
+# AUTO-PRIORITIZATION TESTS
+# =============================================================================
+
+
+class TestAutoPrioritization:
+    """Tests for the planner's auto-prioritization from research data."""
+
+    def test_auto_prioritize_assigns_tiers(self, japan_state):
+        """All items get valid tiers."""
+        from src.agents.planner import PlannerAgent
+
+        agent = PlannerAgent()
+        state = dict(japan_state)
+        state["research"] = {"Tokyo": SAMPLE_RESEARCH_TOKYO}
+
+        priorities = agent._auto_prioritize(state)
+        assert "Tokyo" in priorities
+        valid_tiers = {"must_do", "nice_to_have", "if_nearby", "skip"}
+        for item in priorities["Tokyo"]:
+            assert item["tier"] in valid_tiers
+
+    def test_auto_prioritize_respects_must_dos(self, japan_state):
+        """User must-dos get must_do tier."""
+        from src.agents.planner import PlannerAgent
+
+        agent = PlannerAgent()
+        state = dict(japan_state)
+        state["research"] = {"Tokyo": SAMPLE_RESEARCH_TOKYO}
+        state["must_dos"] = ["Tsukiji Outer Market"]
+
+        priorities = agent._auto_prioritize(state)
+        tsukiji = [i for i in priorities["Tokyo"] if "Tsukiji" in i["name"]]
+        assert len(tsukiji) == 1
+        assert tsukiji[0]["tier"] == "must_do"
+
+    def test_auto_prioritize_caps_must_do_at_30_percent(self, japan_state):
+        """Enforces 30% must_do cap."""
+        from src.agents.planner import PlannerAgent
+
+        agent = PlannerAgent()
+        state = dict(japan_state)
+        # Create research with many high-suitability items
+        many_items = {
+            "places": [
+                {"id": f"tokyo-place-{i}", "name": f"Place {i}", "category": "place",
+                 "traveler_suitability_score": 5, "tags": ["food", "culture"],
+                 "advance_booking": True}
+                for i in range(10)
+            ],
+            "activities": [], "food": [], "logistics": [], "tips": [], "hidden_gems": [],
+        }
+        state["research"] = {"Tokyo": many_items}
+
+        priorities = agent._auto_prioritize(state)
+        tokyo_items = priorities["Tokyo"]
+        must_dos = [i for i in tokyo_items if i["tier"] == "must_do"]
+        total = len(tokyo_items)
+        assert len(must_dos) <= max(1, int(total * 0.30))
+
+
+# =============================================================================
+# DELEGATION AND CHAINING TESTS
+# =============================================================================
+
+
+class TestDelegationAndChaining:
+    """Tests for v2 delegation and chaining routing."""
+
+    @pytest.mark.asyncio
+    async def test_awaiting_input_routes_directly(self, japan_state):
+        """Awaiting input routes directly to the waiting agent."""
+        orch = OrchestratorAgent()
+        state = dict(japan_state)
+        state["_awaiting_input"] = "planner"
+        result = await orch.route(state, "yes, keep the original")
+        assert result["target_agent"] == "planner"
+
+    @pytest.mark.asyncio
+    async def test_delegation_routes_to_delegate(self, japan_state):
+        """Delegation routes to the delegate agent."""
+        orch = OrchestratorAgent()
+        state = dict(japan_state)
+        state["_delegate_to"] = "cost"
+        result = await orch.route(state, "checking budget")
+        assert result["target_agent"] == "cost"
+
+    @pytest.mark.asyncio
+    async def test_chain_pops_next_agent(self, japan_state):
+        """Chain routing pops the next agent from the queue."""
+        orch = OrchestratorAgent()
+        state = dict(japan_state)
+        state["_chain"] = ["research", "planner"]
+        result = await orch.route(state, "continue")
+        assert result["target_agent"] == "research"

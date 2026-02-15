@@ -43,6 +43,15 @@ def empty_state() -> TripState:
         messages=[],
         _next="",
         _user_message="",
+        _awaiting_input=None,
+        _callback=None,
+        _delegate_to=None,
+        _chain=[],
+        _routing_echo="",
+        _error_agent=None,
+        _error_context=None,
+        _loopback_depth=0,
+        onboarding_depth="",
     )
 
 
@@ -133,6 +142,15 @@ def japan_state() -> TripState:
         messages=[],
         _next="",
         _user_message="",
+        _awaiting_input=None,
+        _callback=None,
+        _delegate_to=None,
+        _chain=[],
+        _routing_echo="",
+        _error_agent=None,
+        _error_context=None,
+        _loopback_depth=0,
+        onboarding_depth="",
     )
 
 
@@ -222,6 +240,15 @@ def morocco_state() -> TripState:
         messages=[],
         _next="",
         _user_message="",
+        _awaiting_input=None,
+        _callback=None,
+        _delegate_to=None,
+        _chain=[],
+        _routing_echo="",
+        _error_agent=None,
+        _error_context=None,
+        _loopback_depth=0,
+        onboarding_depth="",
     )
 
 
@@ -290,6 +317,15 @@ def paris_state() -> TripState:
         messages=[],
         _next="",
         _user_message="",
+        _awaiting_input=None,
+        _callback=None,
+        _delegate_to=None,
+        _chain=[],
+        _routing_echo="",
+        _error_agent=None,
+        _error_context=None,
+        _loopback_depth=0,
+        onboarding_depth="",
     )
 
 
@@ -363,6 +399,15 @@ def long_trip_state() -> TripState:
         messages=[],
         _next="",
         _user_message="",
+        _awaiting_input=None,
+        _callback=None,
+        _delegate_to=None,
+        _chain=[],
+        _routing_echo="",
+        _error_agent=None,
+        _error_context=None,
+        _loopback_depth=0,
+        onboarding_depth="",
     )
 
 
