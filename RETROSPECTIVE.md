@@ -9,11 +9,12 @@
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
-2. [Product Requirements Document (PRD)](#2-product-requirements-document-prd)
-3. [High-Level Design (HLD)](#3-high-level-design-hld)
-4. [Low-Level Design (LLD)](#4-low-level-design-lld)
-5. [Retrospective](#5-retrospective)
-6. [Testing Strategy](#6-testing-strategy)
+2. [LangGraph Architecture](#2-langgraph-architecture)
+3. [Product Requirements Document (PRD)](#3-product-requirements-document-prd)
+4. [High-Level Design (HLD)](#4-high-level-design-hld)
+5. [Low-Level Design (LLD)](#5-low-level-design-lld)
+6. [Retrospective](#6-retrospective)
+7. [Testing Strategy](#7-testing-strategy)
 
 ---
 
@@ -48,9 +49,169 @@ A **per-agent memory system** where each specialist agent owns a single `.md` fi
 
 ---
 
-## 2. Product Requirements Document (PRD)
+## 2. LangGraph Architecture
 
-### 2.1 Background
+### 2.1 Graph Topology
+
+The system uses a **hub-and-spoke** `StateGraph(TripState)` where every user message enters through the orchestrator, gets routed to exactly one specialist agent, and terminates. There are no multi-agent chains or loops — each request is a single `orchestrator → specialist → END` pass.
+
+**Defined in:** `src/graph.py`
+
+```
+                         Telegram (handlers.py)
+                               |
+                               v
+                    +-----------------------+
+                    |    StateGraph(TripState)
+                    +-----------------------+
+                               |
+                    +-----------------------+
+                    |   ORCHESTRATOR (entry) |
+                    |   _classify_intent()   |
+                    |   _check_prerequisites |
+                    +-----------+-----------+
+                                |
+              route_from_orchestrator(state._next)
+                                |
+        +-------+-------+------+------+--------+--------+--------+
+        |       |       |      |      |        |        |        |
+        v       v       v      v      v        v        v        v
+    Onboarding Research Librarian Planner Prioritizer Scheduler Feedback Cost
+        |       |       |      |      |        |        |        |
+        +-------+-------+------+------+--------+--------+--------+
+                                |
+                               END
+```
+
+**9 nodes**, all async. 1 conditional edge (orchestrator → specialists). 8 fixed edges (specialists → END).
+
+### 2.2 Routing: Three-Tier Decision
+
+The orchestrator (`OrchestratorAgent.route()`) uses a three-tier system to decide which agent handles each message:
+
+**Tier 1: Command Detection** — Slash commands map directly:
+
+| Command | Agent | Notes |
+|---------|-------|-------|
+| `/start` | onboarding | Redirects to welcome-back if already onboarded |
+| `/research [city\|all]` | research | |
+| `/library` | librarian | Markdown knowledge base sync |
+| `/priorities` | prioritizer | Prerequisite: research |
+| `/plan` | planner | Prerequisite: research |
+| `/agenda` | scheduler | Prerequisite: high_level_plan |
+| `/feedback` | feedback | |
+| `/costs [subcmd]` | cost | |
+| `/status`, `/help` | orchestrator | Handled directly (no routing) |
+| `/trips`, `/mytrips` | orchestrator | Handled by handlers.py |
+
+**Tier 2: Onboarding Guard** — If `onboarding_complete` is false, all non-command messages go to onboarding.
+
+**Tier 3: LLM Intent Classification** — For natural language messages, Claude classifies intent:
+
+```python
+# Classification prompt includes agent descriptions + cue examples:
+# "I'm thinking about food in Tokyo" → research
+# "That was a long day" → feedback
+# "We spent a lot today" → cost
+# "What should I definitely not miss?" → prioritizer
+# "What's the plan for tomorrow?" → scheduler
+
+# On-trip bias: when detailed_agenda or feedback_log exist,
+# biases toward scheduler, feedback, and cost agents.
+```
+
+The LLM returns a single agent name. If the agent has unmet prerequisites, the orchestrator returns a helpful suggestion instead.
+
+### 2.3 Prerequisite Soft Guards
+
+Certain agents require prior state before they can work:
+
+```python
+PREREQUISITES = {
+    "prioritizer": [("research", "I'd need research findings...")],
+    "planner":     [("research", "I'll need research on your cities...")],
+    "scheduler":   [("high_level_plan", "I need a day-by-day plan...")],
+}
+```
+
+These are **soft guards** — they return a helpful offer (e.g., "Want me to research your cities first?") rather than blocking. The user can always override.
+
+### 2.4 Node Execution
+
+All specialist nodes use a shared `_specialist_node(agent_name, state)` function:
+
+1. Lazy-load the agent singleton via `_get_agent(name)`
+2. Extract `_user_message` from state (set by orchestrator)
+3. Call `agent.handle(state, user_msg)` → returns `{response, state_updates}`
+4. Prepend any `_routing_echo` (orchestrator's preamble like "Let me check with the research team...")
+5. Append to `conversation_history` with timestamp and agent attribution
+6. Return `{messages, conversation_history, current_agent, **state_updates, _next: END}`
+
+The orchestrator node is special — it can terminate directly (for `/status`, `/help`, welcome-back) or set `_next` to route to a specialist.
+
+### 2.5 State Schema Summary
+
+`TripState` is a `TypedDict` (required by LangGraph) with 30+ fields organized into domains:
+
+| Domain | Key Fields | Populated By |
+|--------|-----------|-------------|
+| Identity | `trip_id`, `trip_title`, `created_at` | Onboarding |
+| Destination | `destination` (DestinationIntel: 25+ fields) | Research agent (Mode 1) |
+| Configuration | `cities`, `travelers`, `budget`, `dates`, `interests`, `must_dos` | Onboarding |
+| Research | `research` (dict[city_name → CityResearch]) | Research agent (Mode 2) |
+| Priorities | `priorities` (dict[city_name → PrioritizedItem[]]) | Prioritizer |
+| Planning | `high_level_plan` (DayPlan[]), `plan_status`, `plan_version` | Planner |
+| Scheduling | `detailed_agenda` (DetailedDay[] with minute-level slots) | Scheduler |
+| Feedback | `feedback_log` (FeedbackEntry[] with energy, discoveries, adjustments) | Feedback |
+| Costs | `cost_tracker` (totals, by_category, by_city, benchmarks, tips) | Cost |
+| Internal | `_next`, `_user_message`, `current_agent`, `messages` | Graph nodes |
+
+State flows through nodes as an immutable dict — each node returns a partial update that LangGraph merges.
+
+### 2.6 Phase-Aware Behavior
+
+The orchestrator shifts its personality based on trip phase:
+
+| Phase | Mode | Behavior |
+|-------|------|----------|
+| Pre-trip (no agenda/feedback) | **TRAVEL STRATEGIST** | Brainstorming partner. Reads conversational cues, bounces ideas, suggests next steps. |
+| On-trip (has agenda or feedback) | **EXECUTIVE ASSISTANT** | Day runner. Times, locations, routes, weather pivots, budget tracking, end-of-day check-ins. |
+
+This affects both the orchestrator's system prompt and the intent classification bias (on-trip biases toward scheduler/feedback/cost).
+
+### 2.7 External Integration
+
+```
+    Telegram Bot API
+          |
+          v
+    handlers.py: process_message()
+          |
+          +-- Load prior state from TripRepository (SQLite via aiosqlite)
+          |
+          +-- graph.ainvoke(input_state, config={thread_id: trip_id})
+          |       |
+          |       +-- Orchestrator → Specialist → END
+          |       |
+          |       v
+          |   Result: {messages, state_updates, current_agent, ...}
+          |
+          +-- repo.merge_state(trip_id, state_updates)
+          |
+          +-- build_and_write_agent_memory(trip_id, agent, state)  [async, sole writer]
+          |
+          +-- _generate_and_append_notes(...)  [async, Haiku LLM]
+          |
+          +-- split_message(response) → Telegram reply
+```
+
+The graph is compiled once at startup with an optional LangGraph checkpointer. `handlers.py` owns all side effects (DB persistence, memory file writes, Telegram replies).
+
+---
+
+## 3. Product Requirements Document (PRD)
+
+### 3.1Background
 
 The travel planning bot uses a multi-agent architecture coordinated by LangGraph. An orchestrator routes user messages to specialist agents (research, planner, scheduler, prioritizer, feedback, cost), each powered by Anthropic Claude. The system manages trip state as a `TripState` TypedDict flowing through a state graph.
 
@@ -60,7 +221,7 @@ Prior to this change, two shared files (`strategic.md` and `tactical.md`) were g
 - **Token budget pressure**: The shared memory consumed 1,100--1,700 tokens before the agent even began its own reasoning, compressing the space available for complex outputs.
 - **No learning**: Agents had no mechanism to record qualitative observations (e.g., "user prefers street food over fine dining") that persist across interactions.
 
-### 2.2 User Stories
+### 3.2User Stories
 
 **US-1: Research Agent Produces Complete JSON**
 > As a user who triggers `/research all`, I expect the research agent to return complete, parseable JSON for every city, so that the planning pipeline can proceed without manual intervention.
@@ -133,7 +294,7 @@ Acceptance Criteria:
 - Memory truncated if it would exceed 160K input budget, preserving notes section.
 - Warning logged on truncation.
 
-### 2.3 Non-Functional Requirements
+### 3.3Non-Functional Requirements
 
 | Requirement | Target |
 |-------------|--------|
@@ -144,7 +305,7 @@ Acceptance Criteria:
 | Write safety | Atomic writes + async locking; no data corruption on concurrent access |
 | Test coverage | All public API functions tested; integration tests for system prompt injection |
 
-### 2.4 Out of Scope
+### 3.4Out of Scope
 
 - Migration of existing `strategic.md` / `tactical.md` files to the new per-agent format.
 - UI changes in the Telegram bot (no user-facing changes).
@@ -152,9 +313,9 @@ Acceptance Criteria:
 
 ---
 
-## 3. High-Level Design (HLD)
+## 4. High-Level Design (HLD)
 
-### 3.1 Architecture Overview
+### 4.1Architecture Overview
 
 ```
                          User Message (Telegram)
@@ -200,7 +361,7 @@ Acceptance Criteria:
     context (no file)   in data/trips/{id}/
 ```
 
-### 3.2 Data Flow: Agent Invocation
+### 4.2Data Flow: Agent Invocation
 
 ```
     Agent.build_system_prompt(state)
@@ -238,7 +399,7 @@ Acceptance Criteria:
     --- END AGENT MEMORY ---
 ```
 
-### 3.3 Data Flow: Post-Invocation Memory Write
+### 4.3Data Flow: Post-Invocation Memory Write
 
 ```
     handlers.py: process_message()   (SOLE WRITER)
@@ -270,7 +431,7 @@ Acceptance Criteria:
                  +-- On failure: _log_notes_failure (first 3, then every 10th)
 ```
 
-### 3.4 Memory File Structure
+### 4.4Memory File Structure
 
 Each agent's `.md` file follows a consistent multi-zone structure:
 
@@ -308,7 +469,7 @@ Interests: food, temples, photography
 - **Pinned notes** (`[pinned]` tag): Durable preferences (dietary, mobility, strong likes/dislikes). Capped at 10 lines.
 - **Ephemeral notes**: Session-specific insights. Capped at 25 lines.
 
-### 3.5 Per-Agent Data Layout
+### 4.5Per-Agent Data Layout
 
 ```
 data/trips/{trip_id}/
@@ -320,7 +481,7 @@ data/trips/{trip_id}/
 +-- cost.md          <- Trip context (extended) + cost knowledge + spending + benchmarks + tips
 ```
 
-### 3.6 Token Budget Assignment
+### 4.6Token Budget Assignment
 
 Output budgets (defined in `src/agents/constants.py`):
 ```
@@ -345,7 +506,7 @@ def _truncate_memory(memory: str, available_tokens: int) -> str:
     # available = _DEFAULT_INPUT_BUDGET - base_prompt_tokens - output_budget
 ```
 
-### 3.7 Component Interaction Matrix
+### 4.7Component Interaction Matrix
 
 | Component | Reads | Writes | Dispatches To |
 |-----------|-------|--------|---------------|
@@ -359,9 +520,9 @@ def _truncate_memory(memory: str, available_tokens: int) -> str:
 
 ---
 
-## 4. Low-Level Design (LLD)
+## 5. Low-Level Design (LLD)
 
-### 4.1 `src/agents/constants.py` *(new file)*
+### 6.1`src/agents/constants.py` *(new file)*
 
 Single source of truth for agent configuration. Breaks the circular import between `base.py` and `trip_memory.py`.
 
@@ -373,7 +534,7 @@ AGENT_MAX_TOKENS: dict[str, int] = {
 NOTES_ELIGIBLE_AGENTS = {"research", "planner", "feedback"}
 ```
 
-### 4.2 `src/agents/base.py`
+### 6.2`src/agents/base.py`
 
 Imports `MEMORY_AGENTS` and `AGENT_MAX_TOKENS` from `constants.py` (no longer defines them).
 
@@ -405,7 +566,7 @@ if memory:
 
 **`_build_memory_sections` is deleted.** Agent subclasses no longer override this method. Memory building is fully centralized in `trip_memory.py` via `_ALL_BUILDERS`.
 
-### 4.3 `src/tools/trip_memory.py`
+### 6.3`src/tools/trip_memory.py`
 
 **Public API:**
 
@@ -468,7 +629,7 @@ _build_slim_context(state) -> str     # backwards-compat wrapper
 
 **Legacy API:** All removed. `generate_strategic_memory`, `generate_tactical_memory`, `write_trip_memory`, `read_trip_memory`, and all `_build_*` backward-compat aliases are deleted. Test `test_legacy_functions_removed` confirms they are gone.
 
-### 4.4 Agent Subclasses *(simplified in v2)*
+### 6.4Agent Subclasses *(simplified in v2)*
 
 All 6 agent subclasses had their `_build_memory_sections` overrides **deleted**. Memory building is now fully centralized in `trip_memory.py` via the `_ALL_BUILDERS` module-level dispatch dict. Agents only define `agent_name` and `get_system_prompt()`.
 
@@ -476,7 +637,7 @@ All 6 agent subclasses had their `_build_memory_sections` overrides **deleted**.
 
 **`src/agents/orchestrator.py`** -- `_get_state_summary` enriched with research depth (researched/total cities, item counts), plan status, feedback history with energy levels, and budget spent. Capped at 12 lines (`_MAX_ROUTING_CONTEXT_LINES`).
 
-### 4.5 `src/agents/orchestrator.py`
+### 5.5 `src/agents/orchestrator.py`
 
 **`_welcome_back_with_ideas` unchanged** — reads `generate_status(state)` directly (no file I/O).
 
@@ -493,7 +654,7 @@ def _get_state_summary(self, state):
     # Budget: $1,234 spent
 ```
 
-### 4.6 `src/telegram/handlers.py` *(significantly refactored in v2)*
+### 5.6 `src/telegram/handlers.py` *(significantly refactored in v2)*
 
 **Handler is the sole writer.** All memory writes happen here, not in agents.
 
@@ -529,7 +690,7 @@ def _log_notes_failure(agent_name)
     # Log first 3 failures, then every 10th (with exc_info=True)
 ```
 
-### 4.7 `tests/test_trip_memory.py` *(updated in v2)*
+### 5.7 `tests/test_trip_memory.py` *(updated in v2)*
 
 Test classes and counts:
 
@@ -558,9 +719,9 @@ Full suite total: **289 tests passing**.
 
 ---
 
-## 5. Retrospective
+## 6. Retrospective
 
-### 5.1 What Went Well (v1 + v2)
+### 6.1What Went Well (v1 + v2)
 
 **Root cause identification was fast** (v1). The JSON truncation bug had clear symptoms: `_parse_json` logged warnings with char counts showing responses consistently hitting the 4,096-token ceiling. Correlating this with the hardcoded `max_tokens` in `BaseAgent.__init__` took minutes, not hours.
 
@@ -574,7 +735,7 @@ Full suite total: **289 tests passing**.
 
 **Removing legacy functions was easier than maintaining them** (v2). Pre-flight grep confirmed zero production callers. Deleting the functions + aliases and adding a `test_legacy_functions_removed` test was simpler than maintaining deprecated wrappers.
 
-### 5.2 What Was Tricky
+### 6.2What Was Tricky
 
 **Async conversion of write functions** (v2). `build_agent_memory_content` needed to stay sync (called from `build_system_prompt` in an agent's hot path), while `refresh_agent_memory` and `append_agent_notes` needed to be async (for locking). The boundary is clear — sync reads state, async writes files — but required careful propagation of `await` through `handlers.py`.
 
@@ -584,7 +745,7 @@ Full suite total: **289 tests passing**.
 
 **Cross-agent shared insights ordering** (v2). Agent X's `[shared]` notes are written _after_ X responds. So if LangGraph routes through X then Y in a single pass, Y won't see X's shared notes until the next request. This is an eventual-consistency tradeoff documented in code comments.
 
-### 5.3 Blind Spots Addressed
+### 6.3Blind Spots Addressed
 
 **Blind spot: Uniform token budgets** (v1). The original `max_tokens=4096` was set during initial development. The per-agent `AGENT_MAX_TOKENS` dict makes budget decisions explicit.
 
@@ -598,7 +759,7 @@ Full suite total: **289 tests passing**.
 
 **Blind spot: Orchestrator routing blind** (v2). The orchestrator routed on thin destination context without knowing research depth, plan status, or feedback patterns. Enriching `_get_state_summary` provides the routing context needed for smart delegation.
 
-### 5.4 Risks and Mitigations
+### 6.4Risks and Mitigations
 
 | Risk | Mitigation |
 |------|------------|
@@ -612,9 +773,9 @@ Full suite total: **289 tests passing**.
 
 ---
 
-## 6. Testing Strategy
+## 7. Testing Strategy
 
-### 6.1 Test Architecture
+### 7.1Test Architecture
 
 Tests are organized by functional concern, not by file. Each test class has a focused responsibility:
 
@@ -632,7 +793,7 @@ tests/test_trip_memory.py
 +-- TestPhasePrompt                (unit: phase-appropriate prompt generation)
 ```
 
-### 6.2 Fixture Hierarchy
+### 7.2Fixture Hierarchy
 
 Tests use a progressive fixture chain that mirrors real trip progression, plus edge-case fixtures:
 
@@ -661,7 +822,7 @@ large_research_state — Japan with 60+ items per city. Tests memory size limits
 
 This chain allows testing each agent's memory builder at the exact state it would encounter in production.
 
-### 6.3 Key Test Scenarios
+### 7.3Key Test Scenarios
 
 **Agent Memory Sections (8 tests):**
 - Each agent's builder is tested with the appropriate fixture state.
@@ -690,7 +851,7 @@ This chain allows testing each agent's memory builder at the exact state it woul
 - Captures the LLM prompt to verify it contains the correct phase-appropriate suggestion (e.g., `/research all` when no research exists).
 - Verifies `generate_status(state)` is used as context (no file reads).
 
-### 6.4 Test Execution
+### 7.4Test Execution
 
 ```bash
 # Run full suite
@@ -703,7 +864,7 @@ pytest tests/test_trip_memory.py -v
 pytest tests/ --cov=src --cov-report=term-missing
 ```
 
-### 6.5 What Is NOT Tested (and Why)
+### 7.5What Is NOT Tested (and Why)
 
 | Area | Reason |
 |------|--------|
