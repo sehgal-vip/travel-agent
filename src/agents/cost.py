@@ -57,7 +57,7 @@ For savings tips, generate them dynamically based on the destination — never h
 class CostAgent(BaseAgent):
     agent_name = "cost"
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state=None) -> str:
         return SYSTEM_PROMPT
 
     async def handle(self, state: TripState, user_message: str) -> dict:

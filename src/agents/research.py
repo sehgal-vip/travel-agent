@@ -101,7 +101,7 @@ class ResearchAgent(BaseAgent):
         super().__init__()
         self.search_tool = WebSearchTool()
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state=None) -> str:
         return SYSTEM_PROMPT
 
     async def handle(self, state: TripState, user_message: str) -> dict:
@@ -178,7 +178,10 @@ class ResearchAgent(BaseAgent):
         logger.info("LLM synthesis starting: destination intel for %s", country)
         response = await self.llm.ainvoke(messages)
         response_text = response.content
-        logger.info("LLM synthesis complete: destination intel for %s (%d chars)", country, len(response_text))
+        logger.info(
+            "LLM synthesis complete: destination intel for %s (chars=%d, est_tokens=%d, max_tokens=%d)",
+            country, len(response_text), len(response_text) // 3, self.llm.max_tokens,
+        )
 
         # Parse the destination intel
         intel = self._parse_json(response_text)
@@ -187,13 +190,36 @@ class ResearchAgent(BaseAgent):
             # Merge with existing destination data (keep onboarding fields)
             merged = {**state.get("destination", {}), **intel}
 
+            # Generate a conversational abstract instead of just listing fields
+            abstract_prompt = (
+                f"You just gathered destination intelligence for {country}.\n\n"
+                "Write a 3-4 line conversational summary of what travelers should know. "
+                "Highlight the most interesting or surprising practical details. "
+                "Be specific — mention currency, payment norms, key cultural notes. "
+                "End by offering to research cities next.\n\n"
+                "Tone: like a knowledgeable friend sharing what they found. Not a report."
+            )
+            abstract_messages = [
+                SystemMessage(content=abstract_prompt),
+                HumanMessage(content=json.dumps({
+                    "country": country,
+                    "language": merged.get("language"),
+                    "currency": merged.get("currency_code"),
+                    "exchange_rate": merged.get("exchange_rate_to_usd"),
+                    "payment_norms": merged.get("payment_norms"),
+                    "tipping": merged.get("tipping_culture"),
+                    "climate": merged.get("climate_type"),
+                    "season": merged.get("current_season_notes"),
+                    "pricing_tier": merged.get("pricing_tier"),
+                    "cultural_notes": merged.get("cultural_notes", [])[:3],
+                })),
+            ]
+            abstract_response = await self.llm.ainvoke(abstract_messages)
+
             summary = (
-                f"🔍 Destination intelligence for {merged.get('flag_emoji', '')} {country} is ready!\n\n"
-                f"Language: {merged.get('language', '?')}\n"
-                f"Currency: {merged.get('currency_code', '?')} ({merged.get('currency_symbol', '?')})\n"
-                f"Climate: {merged.get('climate_type', '?')}\n"
-                f"Pricing: {merged.get('pricing_tier', '?')}\n\n"
-                f"Would you like me to start researching cities? Say '/research all' or '/research [city name]'."
+                f"**{merged.get('flag_emoji', '')} {country}** — destination intel ready\n\n"
+                f"{abstract_response.content}\n\n"
+                f"_Ready to dive into your cities? Say '/research all' or '/research [city name]'._"
             )
 
             return {
@@ -244,7 +270,10 @@ class ResearchAgent(BaseAgent):
 
         logger.info("LLM synthesis starting: city research for %s (%d days)", city_name, days)
         response = await self.llm.ainvoke(messages)
-        logger.info("LLM synthesis complete: city research for %s (%d chars)", city_name, len(response.content))
+        logger.info(
+            "LLM synthesis complete: city research for %s (chars=%d, est_tokens=%d, max_tokens=%d)",
+            city_name, len(response.content), len(response.content) // 3, self.llm.max_tokens,
+        )
         research_data = self._parse_json(response.content)
 
         if research_data:
@@ -262,16 +291,32 @@ class ResearchAgent(BaseAgent):
                 for k in ("places", "activities", "food", "logistics", "tips", "hidden_gems")
             )
 
+            # Generate a conversational abstract
+            abstract_prompt = (
+                f"You just researched {city_name} for a {traveler_type} trip ({days} days).\n"
+                f"Interests: {', '.join(interests)}\n\n"
+                "Write a 3-4 line conversational abstract of what you found. "
+                "Highlight what stands out — the best finds, surprises, or things that "
+                "match their interests. Be specific (name 2-3 top items). "
+                "End by offering to go deeper into any category.\n\n"
+                "Tone: like a knowledgeable friend sharing what they found. Not a report."
+            )
+            abstract_messages = [
+                SystemMessage(content=abstract_prompt),
+                HumanMessage(content=json.dumps({
+                    "total": total,
+                    "places": [p.get("name") for p in research_data.get("places", [])[:5]],
+                    "food": [f.get("name") for f in research_data.get("food", [])[:5]],
+                    "hidden_gems": [g.get("name") for g in research_data.get("hidden_gems", [])[:3]],
+                    "activities": [a.get("name") for a in research_data.get("activities", [])[:3]],
+                })),
+            ]
+            abstract_response = await self.llm.ainvoke(abstract_messages)
+
             summary = (
-                f"🔍 Research for {city_name} complete!\n\n"
-                f"Found {total} items:\n"
-                f"  📍 Places: {len(research_data.get('places', []))}\n"
-                f"  🎯 Activities: {len(research_data.get('activities', []))}\n"
-                f"  🍜 Food: {len(research_data.get('food', []))}\n"
-                f"  🚌 Logistics: {len(research_data.get('logistics', []))}\n"
-                f"  💡 Tips: {len(research_data.get('tips', []))}\n"
-                f"  💎 Hidden gems: {len(research_data.get('hidden_gems', []))}\n\n"
-                f"Ready to prioritize? Try /priorities"
+                f"**{city_name}** — {total} items found\n\n"
+                f"{abstract_response.content}\n\n"
+                f"_Say 'tell me more about food' or 'what are the hidden gems?' to go deeper._"
             )
 
             return {"response": summary, "state_updates": {"research": existing}}
@@ -323,6 +368,14 @@ class ResearchAgent(BaseAgent):
                 logger.exception("Research failed for city %s", city_name)
                 messages_parts.append(f"⚠️ Research for {city_name} failed — skipping.")
 
+        messages_parts.append(
+            "---\n"
+            "Research complete! You can:\n"
+            "- **/plan** to generate your day-by-day itinerary\n"
+            "- **/priorities** to fine-tune what matters most (optional)\n"
+            "- Ask me anything about what I found"
+        )
+
         return {"response": "\n\n".join(messages_parts), "state_updates": updates}
 
     def _merge_research(self, existing: dict, new: dict) -> dict:
@@ -361,6 +414,10 @@ class ResearchAgent(BaseAgent):
             start = text.index("{")
             end = text.rindex("}") + 1
             return json.loads(text[start:end])
-        except (ValueError, json.JSONDecodeError):
-            logger.warning("Failed to parse JSON from research response")
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Failed to parse JSON from research response (%d chars). "
+                "Error: %s. Start: %.200s... End: ...%.200s",
+                len(text), exc, text, text[-200:] if len(text) > 200 else text,
+            )
             return None

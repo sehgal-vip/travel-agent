@@ -30,37 +30,80 @@ COMMAND_MAP: dict[str, str] = {
     "/join": "orchestrator",
 }
 
-# Agents that require prior steps to have been completed
+# Agents that require prior steps — soft guards that offer to help
 PREREQUISITES: dict[str, list[tuple[str, str]]] = {
-    "prioritizer": [("research", "You need to research cities first. Try /research all")],
+    "prioritizer": [(
+        "research",
+        "I'd need research findings to help prioritize. "
+        "Want me to research your cities first? Just say 'yes' or /research all"
+    )],
     "planner": [
-        ("research", "You need to research cities first. Try /research all"),
-        ("priorities", "You need to set priorities first. Try /priorities"),
+        (
+            "research",
+            "I'll need research on your cities before building an itinerary. "
+            "Want me to kick that off? /research all"
+        ),
     ],
-    "scheduler": [
-        ("high_level_plan", "You need a plan first. Try /plan"),
-    ],
+    "scheduler": [(
+        "high_level_plan",
+        "I need a day-by-day plan before making a detailed agenda. "
+        "Want me to draft one? /plan"
+    )],
 }
 
 
 class OrchestratorAgent(BaseAgent):
     agent_name = "orchestrator"
 
-    def get_system_prompt(self) -> str:
-        return (
-            "You are the Orchestrator of a multi-agent travel planning assistant. "
+    def get_system_prompt(self, state: TripState | None = None) -> str:
+        """Phase-aware system prompt — shifts from strategist to EA on-trip."""
+        identity = (
+            "You are the lead coordinator of a travel planning team. "
+            "You know everything about the user's trip — it's in your Trip Memory context. "
             "You work for ANY destination worldwide.\n\n"
-            "Your job is to:\n"
-            "1. Answer general questions about the user's trip\n"
-            "2. Help when the user's intent is unclear\n"
-            "3. Suggest what they can do next based on their trip progress\n\n"
-            "RULES:\n"
-            "- Be conversational and helpful\n"
-            "- NEVER expose internal agent names or system architecture\n"
-            "- NEVER assume any destination — always read from state\n"
-            "- When you're not sure what they want, ask ONE clarifying question\n"
-            "- Suggest relevant commands when appropriate"
         )
+
+        # Determine mode from state
+        on_trip = False
+        if state:
+            has_agenda = bool(state.get("detailed_agenda"))
+            has_feedback = bool(state.get("feedback_log"))
+            on_trip = has_agenda or has_feedback
+
+        if on_trip:
+            mode = (
+                "MODE: EXECUTIVE ASSISTANT (on-trip)\n"
+                "You are running the user's day. Be structured and proactive.\n"
+                "- Give clear schedules: times, locations, routes, duration\n"
+                "- Anticipate logistics: weather, transport, opening hours, crowds\n"
+                "- Track budget without being asked — flag if overspending\n"
+                "- Handle problems creatively: 'Rain tomorrow — I've moved the garden to Thursday'\n"
+                "- End-of-day: prompt for a quick check-in, suggest adjustments\n"
+                "- Keep responses organized: use bullet points, time blocks, clear headers\n"
+            )
+        else:
+            mode = (
+                "MODE: TRAVEL STRATEGIST (pre-trip)\n"
+                "You are a brainstorming partner helping shape the trip.\n"
+                "- Read conversational cues — don't wait for commands\n"
+                "- 'I'm thinking about food' → talk about food spots, offer to research\n"
+                "- 'What should I definitely not miss?' → discuss priorities\n"
+                "- Be specific to their destination and interests\n"
+                "- When a prerequisite is missing, offer to handle it\n"
+                "- Bounce ideas, suggest what's next, connect dots\n"
+            )
+
+        rules = (
+            "\nTONE: Warm, direct, knowledgeable — like a sharp, well-traveled friend. "
+            "Never cheesy. Never robotic. Never vague.\n\n"
+            "RULES:\n"
+            "- NEVER expose internal agent names or system architecture\n"
+            "- NEVER assume any destination — always read from Trip Memory / state\n"
+            "- When genuinely unsure, ask ONE clarifying question\n"
+            "- Suggest relevant commands as a convenience, not as the only way to interact"
+        )
+
+        return identity + mode + rules
 
     async def route(self, state: TripState, message: str) -> dict[str, Any]:
         """Determine which agent should handle the message.
@@ -83,14 +126,11 @@ class OrchestratorAgent(BaseAgent):
                 if cmd == "/trip":
                     return await self._handle_trip_command(state, message)
 
-                # Guard /start when onboarding is already complete
+                # Welcome back when onboarding is already complete
                 if cmd == "/start" and state.get("onboarding_complete"):
                     return {
                         "target_agent": "orchestrator",
-                        "response": (
-                            "Your trip is already set up! Use /trip new to plan another trip, "
-                            "or /status to see your current trip."
-                        ),
+                        "response": await self._welcome_back_with_ideas(state),
                     }
 
                 # Welcome message on first /start
@@ -133,37 +173,100 @@ class OrchestratorAgent(BaseAgent):
                 return msg
         return None
 
+    _MAX_ROUTING_CONTEXT_LINES = 12  # Hard cap to prevent context creep
+
     def _get_state_summary(self, state: TripState) -> str:
-        """One-line-per-field summary for classification context."""
-        parts = []
-        if state.get("onboarding_complete"):
-            dest = state.get("destination", {})
-            parts.append(f"Destination: {dest.get('country', '?')}")
-            parts.append(f"Research: {'done' if state.get('research') else 'not done'}")
-            parts.append(f"Priorities: {'done' if state.get('priorities') else 'not done'}")
-            parts.append(f"Plan: {'done' if state.get('high_level_plan') else 'not done'}")
-            parts.append(f"Agenda: {'done' if state.get('detailed_agenda') else 'not done'}")
+        """Enriched state summary for routing context, capped at ~200 tokens."""
+        if not state.get("onboarding_complete"):
+            return "Onboarding: in progress"
+
+        parts: list[str] = []
+        dest = state.get("destination", {})
+        parts.append(f"Destination: {dest.get('country', '?')}")
+
+        # Research status (1 line)
+        research = state.get("research", {})
+        cities = state.get("cities", [])
+        if research:
+            researched = sum(1 for c in cities if c.get("name") in research)
+            items = sum(
+                sum(len(d.get(k, [])) for k in ("places", "activities", "food"))
+                for d in research.values()
+            )
+            parts.append(f"Research: {researched}/{len(cities)} cities, {items} items")
         else:
-            parts.append("Onboarding: in progress")
-        return "\n".join(parts)
+            parts.append("Research: not started")
+
+        # Priorities (1 line)
+        priorities = state.get("priorities", {})
+        parts.append(f"Priorities: {len(priorities)} cities prioritized" if priorities else "Priorities: not done")
+
+        # Plan (1 line)
+        plan = state.get("high_level_plan", [])
+        parts.append(f"Plan: {len(plan)} days" if plan else "Plan: not done")
+
+        # Agenda (1 line)
+        agenda = state.get("detailed_agenda", [])
+        parts.append(f"Agenda: {len(agenda)} days detailed" if agenda else "Agenda: not done")
+
+        # Feedback (1 line)
+        feedback = state.get("feedback_log", [])
+        if feedback:
+            parts.append(
+                f"Feedback: {len(feedback)} entries, "
+                f"last energy={feedback[-1].get('energy_level', '?')}"
+            )
+
+        # Budget (1 line)
+        totals = state.get("cost_tracker", {}).get("totals", {})
+        if totals.get("spent_usd"):
+            parts.append(f"Budget: ${totals['spent_usd']:,.0f} spent")
+
+        return "\n".join(parts[:self._MAX_ROUTING_CONTEXT_LINES])
 
     async def _classify_intent(self, state: TripState, message: str) -> dict[str, Any]:
         """Use LLM to classify natural-language intent into an agent route."""
         state_summary = self._get_state_summary(state)
 
+        # On-trip mode: bias toward action-oriented routing
+        on_trip = bool(state.get("detailed_agenda") or state.get("feedback_log"))
+
         classification_prompt = (
-            "Classify the user's intent into one of these agents:\n"
-            "- onboarding (trip setup, changes to trip config)\n"
-            "- research (learn about places, cities, things to do)\n"
-            "- librarian (library, knowledge base, markdown files)\n"
-            "- prioritizer (rank, prioritize, tier, must-do)\n"
-            "- planner (itinerary, plan, schedule days)\n"
-            "- scheduler (detailed agenda, what to do today/tomorrow)\n"
-            "- feedback (how was today, rate experience, adjustments)\n"
-            "- cost (budget, spending, money, prices, costs)\n"
-            "- orchestrator (general chat, unclear, greeting, 'what's next')\n\n"
+            "You route user messages to the right specialist. "
+            "Read the user's INTENT, not just their words.\n\n"
+            "Agents:\n"
+            "- onboarding: trip setup, change dates/cities/budget/travelers\n"
+            "- research: curious about places, food, activities, 'what's there to do', 'tell me about X'\n"
+            "- librarian: save info, knowledge base, markdown export\n"
+            "- prioritizer: rank, prioritize, 'what's most important', 'must-do'\n"
+            "- planner: itinerary, schedule, 'plan my days', 'what order'\n"
+            "- scheduler: detailed agenda, 'what's today', 'what's tomorrow', 'next 2 days'\n"
+            "- feedback: 'how was today', rate, adjust, 'that was great/bad', 'change plans', energy level\n"
+            "- cost: budget, spending, prices, 'how much', money, convert currency\n"
+            "- orchestrator: general chat, greeting, 'what's next', meta questions\n\n"
+            "CUE EXAMPLES:\n"
+            "- 'I'm thinking about food in Tokyo' → research\n"
+            "- 'That was a long day' → feedback\n"
+            "- 'We spent a lot today' → cost\n"
+            "- 'How much have I spent?' → cost\n"
+            "- 'What should I definitely not miss?' → prioritizer\n"
+            "- 'Can we move the Kyoto day?' → planner\n"
+            "- 'What's the plan for tomorrow?' → scheduler\n"
+            "- 'It's raining, what now?' → scheduler\n"
+            "- 'We're tired, anything chill nearby?' → scheduler\n\n"
+        )
+
+        if on_trip:
+            classification_prompt += (
+                "CONTEXT: User is CURRENTLY ON THEIR TRIP. "
+                "Bias toward scheduler (logistics), feedback (experiences), and cost (spending). "
+                "Any mention of today/tomorrow/time → scheduler. "
+                "Any mention of feelings/energy/experience → feedback.\n\n"
+            )
+
+        classification_prompt += (
             f"TRIP STATE:\n{state_summary}\n\n"
-            "Respond with ONLY the agent name, nothing else."
+            "Respond with ONLY the agent name."
         )
 
         messages = [
@@ -182,28 +285,82 @@ class OrchestratorAgent(BaseAgent):
         if agent_name not in valid_agents:
             agent_name = "orchestrator"
 
-        # Check prerequisites
+        # Check prerequisites — soft guards that offer to help
         guard = self._check_prerequisites(state, agent_name)
         if guard:
             return {"target_agent": "orchestrator", "response": guard}
 
         if agent_name == "orchestrator":
-            # Handle conversationally
             response_text = await self.invoke(state, message)
             return {"target_agent": "orchestrator", "response": response_text}
 
-        # Echo which agent is handling the request
-        _friendly_names = {
-            "research": "research team",
-            "planner": "planning team",
-            "scheduler": "scheduling team",
-            "feedback": "feedback team",
-            "cost": "budget team",
-            "prioritizer": "prioritization team",
-            "librarian": "knowledge base",
-        }
-        friendly = _friendly_names.get(agent_name, agent_name)
-        return {"target_agent": agent_name, "response": f"Let me check with the {friendly} for you..."}
+        return {"target_agent": agent_name}
+
+    async def _welcome_back_with_ideas(self, state: TripState) -> str:
+        """Show trip summary + contextual next-step ideas.
+
+        Reads phase info from state directly (no memory files needed).
+        """
+        dest = state.get("destination", {})
+        flag = dest.get("flag_emoji", "")
+        title = state.get("trip_title") or f"{dest.get('country', 'Your')} Trip"
+
+        # Build context from state directly (no file reads)
+        context = generate_status(state)
+
+        phase_prompt = self._get_phase_prompt(state)
+        response = await self.llm.ainvoke([
+            SystemMessage(content=(
+                "The user is returning to their trip. You have the full trip context below.\n\n"
+                "Write a SHORT welcome-back message (3-6 lines) that:\n"
+                "1. Acknowledges where they are in planning (be specific — mention city names, dates)\n"
+                "2. Gives 2-3 concrete, destination-specific ideas for what to do next\n"
+                "3. Ends with one clear action they can take right now\n\n"
+                "Tone: warm, direct, knowledgeable. Like a friend who remembers everything "
+                "about your trip. Not cheesy, not corporate.\n\n"
+                f"TRIP CONTEXT:\n{context}"
+            )),
+            HumanMessage(content=phase_prompt),
+        ])
+
+        header = f"{flag} **{title}**\n"
+        return f"{header}\n{response.content}"
+
+    def _get_phase_prompt(self, state: TripState) -> str:
+        """Generate a phase-appropriate prompt for the welcome-back message."""
+        dest = state.get("destination", {})
+        country = dest.get("country", "their destination")
+        cities = [c.get("name", "?") for c in state.get("cities", [])]
+        interests = ", ".join(state.get("interests", []))
+
+        if not state.get("research"):
+            return (
+                f"Trip to {country} is anchored — cities: {', '.join(cities)}. "
+                f"Interests: {interests}. "
+                "They haven't researched yet. Suggest specific things worth looking into "
+                f"for {country} (seasonal, cultural, food). Mention /research all."
+            )
+        if not state.get("high_level_plan"):
+            researched = list((state.get("research") or {}).keys())
+            if not state.get("priorities"):
+                return (
+                    f"Research done for: {', '.join(researched)}. "
+                    "They're ready to build their itinerary. "
+                    "Mention /plan as the next step, and /priorities as optional."
+                )
+            return (
+                "Research and priorities done. Help them think about day structure — "
+                f"city order, pacing for {len(cities)} cities. Mention /plan."
+            )
+        if not state.get("detailed_agenda"):
+            return (
+                "Itinerary exists. Suggest getting a detailed agenda for the first days. "
+                "Mention /agenda."
+            )
+        return (
+            "Trip is fully planned. Suggest pre-trip prep specific to "
+            f"{country} — what to download, book, pack. Keep it practical."
+        )
 
     async def _handle_trip_command(self, state: TripState, message: str) -> dict[str, Any]:
         """Handle /trip new, /trip switch <id>, /trip archive <id>."""
@@ -264,10 +421,11 @@ def generate_status(state: TripState) -> str:
     # Next-step suggestion
     if not researched:
         lines.append("\n👉 Next: /research all")
-    elif not prioritized:
-        lines.append("\n👉 Next: /priorities")
     elif not has_plan:
-        lines.append("\n👉 Next: /plan")
+        if not prioritized:
+            lines.append("\n👉 Next: /plan (or /priorities to fine-tune first)")
+        else:
+            lines.append("\n👉 Next: /plan")
     elif not has_agenda:
         lines.append("\n👉 Next: /agenda")
     else:

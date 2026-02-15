@@ -225,6 +225,185 @@ def morocco_state() -> TripState:
     )
 
 
+@pytest.fixture
+def paris_state() -> TripState:
+    """Single-city trip — Paris 3 days. Tests edge cases with no multi-city routing."""
+    return TripState(
+        trip_id="paris-2026",
+        trip_title="Weekend in Paris",
+        created_at="2026-05-01T00:00:00Z",
+        updated_at="2026-05-01T00:00:00Z",
+        destination={
+            "country": "France",
+            "country_code": "FR",
+            "region": "Western Europe",
+            "flag_emoji": "\U0001f1eb\U0001f1f7",
+            "language": "French",
+            "useful_phrases": {"thank you": "merci", "hello": "bonjour"},
+            "currency_code": "EUR",
+            "currency_symbol": "\u20ac",
+            "exchange_rate_to_usd": 0.92,
+            "tipping_culture": "Not expected but appreciated for good service",
+            "payment_norms": "Card widely accepted",
+            "time_zone": "Europe/Paris",
+            "climate_type": "temperate",
+            "researched_at": "2026-05-01T10:00:00Z",
+        },
+        cities=[
+            {"name": "Paris", "country": "France", "days": 3, "order": 1},
+        ],
+        travelers={"count": 1, "type": "solo", "dietary": ["vegetarian"], "accessibility": []},
+        budget={"style": "midrange", "total_estimate_usd": 1200, "splurge_on": ["food"], "save_on": []},
+        dates={"start": "2026-05-15", "end": "2026-05-17", "total_days": 3},
+        interests=["food", "art", "architecture"],
+        must_dos=["Louvre Museum"],
+        deal_breakers=[],
+        accommodation_pref="hotel",
+        transport_pref=["metro"],
+        research={},
+        priorities={},
+        high_level_plan=[],
+        plan_status="not_started",
+        plan_version=0,
+        detailed_agenda=[],
+        feedback_log=[],
+        cost_tracker={
+            "budget_total_usd": 1200,
+            "budget_daily_target_usd": 400,
+            "local_currency": "EUR",
+            "currency_symbol": "\u20ac",
+            "exchange_rate": 0.92,
+            "pricing_benchmarks": {},
+            "daily_log": [],
+            "totals": {"spent_usd": 0, "remaining_usd": 1200, "daily_avg_usd": 0, "projected_total_usd": 0, "status": "on_track"},
+            "by_category": {},
+            "by_city": {},
+            "savings_tips": [],
+        },
+        library={},
+        current_agent="orchestrator",
+        conversation_history=[],
+        onboarding_complete=True,
+        onboarding_step=11,
+        current_trip_day=1,
+        agent_scratch={},
+        messages=[],
+        _next="",
+        _user_message="",
+    )
+
+
+@pytest.fixture
+def long_trip_state() -> TripState:
+    """28-day 6-city trip — tests token budget pressure and large state handling."""
+    return TripState(
+        trip_id="europe-grand-2026",
+        trip_title="Grand European Tour",
+        created_at="2026-06-01T00:00:00Z",
+        updated_at="2026-06-01T00:00:00Z",
+        destination={
+            "country": "Multi-country",
+            "country_code": "EU",
+            "region": "Europe",
+            "flag_emoji": "\U0001f1ea\U0001f1fa",
+            "language": "Various",
+            "useful_phrases": {},
+            "currency_code": "EUR",
+            "currency_symbol": "\u20ac",
+            "exchange_rate_to_usd": 0.92,
+            "tipping_culture": "Varies by country",
+            "payment_norms": "Card widely accepted",
+            "time_zone": "Europe/Berlin",
+            "climate_type": "temperate",
+            "researched_at": "2026-06-01T10:00:00Z",
+        },
+        cities=[
+            {"name": "Paris", "country": "France", "days": 5, "order": 1},
+            {"name": "Barcelona", "country": "Spain", "days": 5, "order": 2},
+            {"name": "Rome", "country": "Italy", "days": 5, "order": 3},
+            {"name": "Vienna", "country": "Austria", "days": 4, "order": 4},
+            {"name": "Prague", "country": "Czech Republic", "days": 4, "order": 5},
+            {"name": "Berlin", "country": "Germany", "days": 5, "order": 6},
+        ],
+        travelers={"count": 4, "type": "family", "dietary": [], "accessibility": []},
+        budget={"style": "midrange", "total_estimate_usd": 15000, "splurge_on": ["food", "accommodation"], "save_on": ["transport"]},
+        dates={"start": "2026-07-01", "end": "2026-07-28", "total_days": 28},
+        interests=["food", "history", "art", "architecture", "nightlife"],
+        must_dos=["Eiffel Tower", "Colosseum", "Sagrada Familia"],
+        deal_breakers=["long bus rides"],
+        accommodation_pref="hotel",
+        transport_pref=["train", "flight"],
+        research={},
+        priorities={},
+        high_level_plan=[],
+        plan_status="not_started",
+        plan_version=0,
+        detailed_agenda=[],
+        feedback_log=[],
+        cost_tracker={
+            "budget_total_usd": 15000,
+            "budget_daily_target_usd": 536,
+            "local_currency": "EUR",
+            "currency_symbol": "\u20ac",
+            "exchange_rate": 0.92,
+            "pricing_benchmarks": {},
+            "daily_log": [],
+            "totals": {"spent_usd": 0, "remaining_usd": 15000, "daily_avg_usd": 0, "projected_total_usd": 0, "status": "on_track"},
+            "by_category": {},
+            "by_city": {},
+            "savings_tips": [],
+        },
+        library={},
+        current_agent="orchestrator",
+        conversation_history=[],
+        onboarding_complete=True,
+        onboarding_step=11,
+        current_trip_day=1,
+        agent_scratch={},
+        messages=[],
+        _next="",
+        _user_message="",
+    )
+
+
+@pytest.fixture
+def large_research_state(japan_state) -> TripState:
+    """Japan state with extensive research data — tests memory size limits."""
+    state = dict(japan_state)
+    # Generate large research dataset for Tokyo
+    places = [
+        {"name": f"Place {i}", "category": "place", "subcategory": "landmark",
+         "description": f"A notable landmark #{i} in Tokyo", "cost_usd": 10 + i,
+         "time_needed_hrs": 1.5, "best_time": "morning", "tags": ["culture"],
+         "advance_booking": i % 5 == 0, "booking_lead_time": "1 week" if i % 5 == 0 else None}
+        for i in range(20)
+    ]
+    activities = [
+        {"name": f"Activity {i}", "category": "activity", "subcategory": "tour",
+         "description": f"Fun activity #{i}", "cost_usd": 30 + i, "time_needed_hrs": 2,
+         "tags": ["adventure"]}
+        for i in range(15)
+    ]
+    food = [
+        {"name": f"Food Spot {i}", "category": "food", "subcategory": "restaurant",
+         "description": f"Great food spot #{i}", "cost_usd": 15 + i, "tags": ["food"],
+         "must_try_items": [f"dish-{i}"]}
+        for i in range(25)
+    ]
+    state["research"] = {
+        "Tokyo": {"places": places, "activities": activities, "food": food,
+                  "logistics": [], "tips": [], "hidden_gems": [],
+                  "last_updated": "2026-02-02T10:00:00Z"},
+        "Kyoto": {"places": places[:10], "activities": activities[:8], "food": food[:15],
+                  "logistics": [], "tips": [], "hidden_gems": [],
+                  "last_updated": "2026-02-02T11:00:00Z"},
+        "Osaka": {"places": places[:5], "activities": activities[:5], "food": food[:8],
+                  "logistics": [], "tips": [], "hidden_gems": [],
+                  "last_updated": "2026-02-02T12:00:00Z"},
+    }
+    return TripState(**state)
+
+
 @pytest_asyncio.fixture
 async def async_db(tmp_path):
     """Create an in-memory async database for testing."""

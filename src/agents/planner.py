@@ -80,17 +80,22 @@ Each DayPlan:
 class PlannerAgent(BaseAgent):
     agent_name = "planner"
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state=None) -> str:
         return SYSTEM_PROMPT
 
     async def handle(self, state: TripState, user_message: str) -> dict:
         """Generate or refine a high-level itinerary."""
         priorities = state.get("priorities", {})
+        auto_prioritized = False
         if not priorities:
-            return {
-                "response": "I need priorities to build a plan. Run /priorities first.",
-                "state_updates": {},
-            }
+            research = state.get("research", {})
+            if not research:
+                return {
+                    "response": "I need research data before building a plan. Run /research all first.",
+                    "state_updates": {},
+                }
+            priorities = self._auto_prioritize(state)
+            auto_prioritized = True
 
         cities = state.get("cities", [])
         dates = state.get("dates", {})
@@ -139,6 +144,16 @@ class PlannerAgent(BaseAgent):
             f"  Must-dos: {', '.join(must_dos)}\n"
             f"  Climate: {dest.get('climate_type', '?')}\n"
             f"  Intercity transport: {dest.get('common_intercity_transport', [])}\n\n"
+        )
+
+        if auto_prioritized:
+            prompt += (
+                "NOTE: Priorities were auto-generated from research data (not manually curated). "
+                "Use your judgment to refine them. Must-dos from the user's explicit list should be "
+                "treated as genuine must-dos.\n\n"
+            )
+
+        prompt += (
             f"PRIORITIES:\n{json.dumps(priorities_summary, indent=2, default=str)}\n\n"
             f"FOOD OPTIONS:\n{json.dumps(food_by_city, indent=2, default=str)}\n\n"
             "Output a JSON array of DayPlan objects for ALL days, followed by a human-readable summary."
@@ -188,13 +203,17 @@ class PlannerAgent(BaseAgent):
 
             summary_parts.append("Does this look good? I can adjust any day. Say 'approved' to lock it in, or tell me what to change.")
 
+            state_updates = {
+                "high_level_plan": plan_data,
+                "plan_status": "draft",
+                "plan_version": version,
+            }
+            if auto_prioritized:
+                state_updates["priorities"] = priorities
+
             return {
                 "response": "\n".join(summary_parts),
-                "state_updates": {
-                    "high_level_plan": plan_data,
-                    "plan_status": "draft",
-                    "plan_version": version,
-                },
+                "state_updates": state_updates,
             }
 
         # Fallback: parse failed, nothing was saved
@@ -202,6 +221,98 @@ class PlannerAgent(BaseAgent):
             "response": "I generated a plan but couldn't parse it properly. Try /plan again.",
             "state_updates": {},
         }
+
+    def _auto_prioritize(self, state: TripState) -> dict[str, list[dict]]:
+        """Auto-generate priorities from research data when explicit priorities are missing."""
+        research = state.get("research", {})
+        interests = [i.lower() for i in state.get("interests", [])]
+        must_dos = state.get("must_dos", [])
+        must_dos_lower = [m.lower() for m in must_dos]
+
+        priorities: dict[str, list[dict]] = {}
+
+        for city_name, city_data in research.items():
+            items: list[dict] = []
+            all_research_items = []
+            for category in ("places", "activities", "food", "hidden_gems"):
+                for item in city_data.get(category, []):
+                    all_research_items.append((category, item))
+
+            scored: list[tuple[int, str, dict]] = []
+            for category, item in all_research_items:
+                score = self._heuristic_score(item, interests, must_dos_lower, category)
+                scored.append((score, category, item))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            total_items = len(scored)
+            max_must_do = max(1, int(total_items * 0.30))
+            must_do_count = 0
+
+            for score, category, item in scored:
+                tier = self._score_to_tier(score)
+                # Enforce 30% must_do cap
+                if tier == "must_do":
+                    if must_do_count >= max_must_do:
+                        tier = "nice_to_have"
+                    else:
+                        must_do_count += 1
+
+                items.append({
+                    "item_id": item.get("id", f"{city_name.lower()}-{category}-auto"),
+                    "name": item.get("name", "Unknown"),
+                    "category": category if category != "hidden_gems" else "place",
+                    "tier": tier,
+                    "score": score,
+                    "reason": "Auto-prioritized from research data",
+                    "user_override": False,
+                })
+
+            priorities[city_name] = items
+
+        return priorities
+
+    def _heuristic_score(self, item: dict, interests: list[str], must_dos_lower: list[str], category: str) -> int:
+        """Score a research item 0-100 for auto-prioritization."""
+        name = (item.get("name") or "").lower()
+
+        # User's explicit must-dos get top score
+        if any(m in name or name in m for m in must_dos_lower if m):
+            return 95
+
+        score = 50  # baseline
+
+        # Suitability score (1-5) → adjustment
+        suitability = item.get("traveler_suitability_score")
+        if suitability is not None:
+            score += (suitability - 3) * 10  # 1→-20, 3→0, 5→+20
+
+        # Tag overlap with interests
+        tags = [t.lower() for t in (item.get("tags") or [])]
+        for tag in tags:
+            if tag in interests:
+                score += 8
+
+        # Food category bonus
+        if category == "food":
+            score += 5
+
+        # Advance booking signals significance
+        if item.get("advance_booking"):
+            score += 5
+
+        return max(0, min(100, score))
+
+    @staticmethod
+    def _score_to_tier(score: int) -> str:
+        """Convert a numeric score to a priority tier."""
+        if score >= 75:
+            return "must_do"
+        if score >= 55:
+            return "nice_to_have"
+        if score >= 35:
+            return "if_nearby"
+        return "skip"
 
     async def _adjust_plan(self, state: TripState, message: str, current_plan: list) -> dict:
         """Adjust an existing plan based on user feedback."""

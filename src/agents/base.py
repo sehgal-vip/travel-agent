@@ -9,6 +9,7 @@ from typing import Any
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from src.agents.constants import AGENT_MAX_TOKENS, MEMORY_AGENTS
 from src.config.settings import get_settings
 from src.state import TripState
 
@@ -16,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_destination_context(state: TripState) -> str:
-    """Build a destination-context block injected into every agent's system prompt."""
+    """Build a destination-context block injected into every agent's system prompt.
+
+    Returns an empty string (falsy) when no destination country is set, allowing
+    callers to use a simple ``if dest_context:`` guard.
+    """
     dest = state.get("destination")
     if not dest or not dest.get("country"):
         return ""
@@ -87,6 +92,36 @@ def add_to_conversation_history(state: TripState, role: str, content: str, agent
     return history
 
 
+# ─── Token Budgeting ────────────────────────────────────
+
+_DEFAULT_INPUT_BUDGET = 160_000  # conservative for 200K context models
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative token estimate. Uses //3 to be safe with non-ASCII (CJK, emoji)."""
+    return len(text) // 3
+
+
+def _truncate_memory(memory: str, available_tokens: int) -> str:
+    """Truncate memory to fit within token budget, preserving notes section."""
+    if _estimate_tokens(memory) <= available_tokens:
+        return memory
+    logger.warning(
+        "Memory exceeds token budget (%d > %d). Truncating.",
+        _estimate_tokens(memory), available_tokens,
+    )
+    char_limit = available_tokens * 3  # reverse estimate
+    from src.tools.trip_memory import NOTES_MARKER
+    if NOTES_MARKER in memory:
+        marker_pos = memory.index(NOTES_MARKER)
+        notes = memory[marker_pos:]
+        body_limit = char_limit - len(notes)
+        if body_limit > 200:
+            return memory[:body_limit] + "\n...[truncated]...\n\n" + notes
+        return notes[:char_limit]
+    return memory[:char_limit] + "\n...[truncated]..."
+
+
 class BaseAgent:
     """Wraps ChatAnthropic with model selection and destination-context injection."""
 
@@ -95,10 +130,11 @@ class BaseAgent:
     def __init__(self) -> None:
         settings = get_settings()
         model_id = settings.AGENT_MODELS.get(self.agent_name, settings.DEFAULT_MODEL)
+        max_tokens = AGENT_MAX_TOKENS.get(self.agent_name, 4096)
         self.llm = ChatAnthropic(
             model=model_id,
             anthropic_api_key=settings.ANTHROPIC_API_KEY,
-            max_tokens=4096,
+            max_tokens=max_tokens,
             timeout=settings.LLM_TIMEOUT,
             max_retries=settings.LLM_MAX_RETRIES,
         )
@@ -108,13 +144,48 @@ class BaseAgent:
         "Be warm but concise. Use plain language.\n\n"
     )
 
+    def _ensure_memory_fresh(self, state: TripState) -> str:
+        """Build memory content for this agent's prompt. Does NOT write to disk.
+
+        Only runs for agents in MEMORY_AGENTS. Others get thin destination context.
+        The handler (handlers.py) is the sole writer — it calls build_and_write_agent_memory
+        after the agent responds, ensuring the persisted file reflects post-response state.
+        """
+        if self.agent_name not in MEMORY_AGENTS:
+            return ""
+
+        from src.tools.trip_memory import build_agent_memory_content
+
+        trip_id = state.get("trip_id")
+        if not trip_id:
+            return ""
+
+        return build_agent_memory_content(trip_id, self.agent_name, state) or ""
+
     def build_system_prompt(self, state: TripState) -> str:
-        """Combine tone preamble, agent-specific prompt, and destination context."""
-        base_prompt = self._TONE_PREAMBLE + self.get_system_prompt()
+        """Combine tone preamble, agent-specific prompt, and per-agent memory (or destination context)."""
+        base_prompt = self._TONE_PREAMBLE + self.get_system_prompt(state=state)
+
+        # Specialist agents: refresh + inject their memory file
+        memory = self._ensure_memory_fresh(state)
+        if memory:
+            # Apply token budget to prevent exceeding context window
+            base_tokens = _estimate_tokens(base_prompt)
+            output_budget = AGENT_MAX_TOKENS.get(self.agent_name, 4096)
+            available = _DEFAULT_INPUT_BUDGET - base_tokens - output_budget
+            memory = _truncate_memory(memory, available)
+            return (
+                f"{base_prompt}\n"
+                f"--- {self.agent_name.upper()} MEMORY ---\n"
+                f"{memory}\n"
+                f"--- END {self.agent_name.upper()} MEMORY ---"
+            )
+
+        # Orchestrator/onboarding/librarian + pre-onboarding fallback: thin destination context
         dest_context = get_destination_context(state)
         return f"{base_prompt}\n{dest_context}" if dest_context else base_prompt
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state: TripState | None = None) -> str:
         """Override in subclasses to provide the agent-specific system prompt."""
         return "You are a helpful travel planning assistant."
 

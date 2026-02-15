@@ -113,14 +113,84 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await repo.create_trip(trip_id, user_id, state_to_save)
                 logger.info("State saved for trip %s", trip_id)
 
+                # Update per-agent memory files
+                from src.tools.trip_memory import (
+                    append_agent_notes,
+                    build_and_write_agent_memory,
+                )
+
+                responding_agent = result.get("current_agent", "orchestrator")
+                try:
+                    await build_and_write_agent_memory(trip_id, responding_agent, state_to_save)
+                except Exception:
+                    logger.exception("Failed to write agent memory for %s", responding_agent)
+
+                # Generate LLM notes for agents that benefit from accumulated learnings
+                if _should_generate_notes(result, responding_agent):
+                    try:
+                        await _generate_and_append_notes(
+                            trip_id, responding_agent, result, append_agent_notes
+                        )
+                    except Exception:
+                        _log_notes_failure(responding_agent)
+
                 # Update active trip id if onboarding just completed
                 if result.get("trip_id") and result["trip_id"] != trip_id:
                     new_trip_id = result["trip_id"]
                     context.user_data["active_trip_id"] = new_trip_id
+
+                    # Migrate state to the new trip_id so subsequent messages find it
+                    try:
+                        new_existing = await repo.get_trip(new_trip_id)
+                        if new_existing:
+                            await repo.merge_state(new_trip_id, state_to_save)
+                        else:
+                            await repo.create_trip(new_trip_id, user_id, state_to_save)
+                        # Create directory for agent memory files; they'll be written on first agent run
+                        try:
+                            from pathlib import Path
+                            Path(f"./data/trips/{new_trip_id}").mkdir(parents=True, exist_ok=True)
+                        except Exception:
+                            logger.exception("Failed to create trip directory for %s", new_trip_id)
+                        logger.info("State migrated to new trip %s", new_trip_id)
+                    except Exception:
+                        logger.exception("Failed to migrate state to new trip %s", new_trip_id)
+
                     response_text += (
                         f"\n\nYour trip ID is: `{new_trip_id}`\n"
                         f"Share this with your travel companions — they can join with /join {new_trip_id}"
                     )
+
+                    # Auto-start research after onboarding completes
+                    try:
+                        # Send onboarding confirmation first, then start research
+                        for part in split_message(response_text):
+                            await update.message.reply_text(part)
+                        logger.info("Onboarding response sent, auto-starting research for trip %s", new_trip_id)
+                        response_text = ""  # Clear so we don't send twice
+
+                        research_input = {**state_to_save, "messages": [{"role": "user", "content": "/research all"}]}
+                        research_config = {"configurable": {"thread_id": new_trip_id}}
+                        research_result = await graph.ainvoke(research_input, config=research_config)
+
+                        research_response = _extract_response(research_result)
+                        response_text = research_response
+
+                        # Save research state
+                        research_state = {k: v for k, v in research_result.items() if k not in _INTERNAL_KEYS}
+                        await repo.merge_state(new_trip_id, research_state)
+                        try:
+                            await build_and_write_agent_memory(new_trip_id, "research", research_state)
+                        except Exception:
+                            logger.exception("Failed to write agent memory after auto-research for %s", new_trip_id)
+                        logger.info("Auto-research completed for trip %s", new_trip_id)
+                    except Exception:
+                        logger.exception("Auto-research failed for trip %s", new_trip_id)
+                        if not response_text:
+                            response_text = (
+                                "Your trip is set up! I tried to auto-start research but hit a snag.\n"
+                                "Run /research all to kick it off manually."
+                            )
             except Exception:
                 logger.exception("Failed to save state for trip %s", trip_id)
 
@@ -130,10 +200,11 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     finally:
         typing_task.cancel()
 
-    # Send response, split if needed
-    for part in split_message(response_text):
-        await update.message.reply_text(part)
-    logger.info("Response sent to user %s (%d chars)", user_id, len(response_text))
+    # Send response, split if needed (may be empty if already sent during auto-research)
+    if response_text:
+        for part in split_message(response_text):
+            await update.message.reply_text(part)
+        logger.info("Response sent to user %s (%d chars)", user_id, len(response_text))
 
 
 async def _handle_join(
@@ -442,6 +513,100 @@ async def handle_trip_selection(update: Update, context: ContextTypes.DEFAULT_TY
         f"Use /status to see your trip progress, or just chat to continue planning!"
     )
     logger.info("User %s switched to trip %s via inline button", user_id, trip_id)
+
+
+# ─── Notes Generation Helpers ────────────────────────────
+
+_notes_failure_counts: dict[str, int] = {}
+
+NOTES_MAX_TOKENS = 300
+NOTES_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _should_generate_notes(result: dict, responding_agent: str) -> bool:
+    """Check if this response warrants generating agent notes.
+
+    Notes are generated when a NOTES_ELIGIBLE agent produces state updates
+    in research, planning, or feedback domains.
+    """
+    from src.agents.constants import NOTES_ELIGIBLE_AGENTS
+
+    if responding_agent not in NOTES_ELIGIBLE_AGENTS:
+        return False
+    state_updates = result.get("state_updates", result)
+    return bool(
+        state_updates.get("research")
+        or state_updates.get("high_level_plan")
+        or state_updates.get("feedback_log")
+    )
+
+
+def _extract_notes_context(response_text: str, max_chars: int = 1500) -> str:
+    """Take first line (summary) + tail (conclusions), not blind head truncation."""
+    if len(response_text) <= max_chars:
+        return response_text
+    first_line = response_text.split("\n", 1)[0]
+    tail = response_text[-(max_chars - len(first_line) - 10):]
+    return f"{first_line}\n...\n{tail}"
+
+
+async def _generate_and_append_notes(
+    trip_id: str,
+    responding_agent: str,
+    result: dict,
+    append_fn,
+) -> None:
+    """Generate LLM notes and append to agent memory.
+
+    Uses structured bullet format for robust parsing. Deduplicates against existing notes.
+    Wraps existing notes in XML delimiters for prompt injection protection.
+    """
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage as HMsg
+    from langchain_core.messages import SystemMessage as SMsg
+    from src.tools.trip_memory import read_agent_notes
+
+    existing_notes = read_agent_notes(trip_id, responding_agent) or ""
+
+    notes_llm = ChatAnthropic(model=NOTES_MODEL, max_tokens=NOTES_MAX_TOKENS)
+    notes_response = await notes_llm.ainvoke([
+        SMsg(content=(
+            "You are a travel planning agent's memory system. "
+            "Write 2-3 brief bullet points about patterns, insights, or things to remember. "
+            "Be specific and actionable. No fluff.\n\n"
+            "Always format notes as bullet points starting with `- `. "
+            "If nothing new, return only: `- NONE`\n"
+            "Mark durable preferences (dietary, mobility, strong likes/dislikes) with [pinned]. "
+            "Most notes should NOT be pinned.\n"
+            "If an insight is relevant to OTHER agents (e.g., user energy level, dietary discovery, "
+            "budget surprise), mark with [shared].\n\n"
+            "Write NEW patterns only. Do NOT repeat anything in <existing_notes>."
+        )),
+        HMsg(content=(
+            f"Agent: {responding_agent}\n"
+            f"Work done: {_extract_notes_context(_extract_response(result))}\n\n"
+            f"<existing_notes>\n{existing_notes[-1000:]}\n</existing_notes>"
+        )),
+    ])
+
+    notes_text = notes_response.content.strip()
+    # Extract bullet lines only — ignore any preamble/commentary
+    bullet_lines = [l.strip() for l in notes_text.splitlines() if l.strip().startswith("- ")]
+    # Filter out the "none" signal
+    real_bullets = [l for l in bullet_lines if l.strip().lower() != "- none"]
+    if real_bullets:
+        await append_fn(trip_id, responding_agent, "\n".join(real_bullets))
+
+
+def _log_notes_failure(agent_name: str) -> None:
+    """Log notes generation failures — first 3, then every 10th."""
+    _notes_failure_counts[agent_name] = _notes_failure_counts.get(agent_name, 0) + 1
+    count = _notes_failure_counts[agent_name]
+    if count <= 3 or count % 10 == 0:
+        logger.warning(
+            "Failed to generate agent notes for %s (failure #%d)",
+            agent_name, count, exc_info=True,
+        )
 
 
 def _extract_response(result: dict) -> str:

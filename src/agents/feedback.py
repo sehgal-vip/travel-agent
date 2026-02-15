@@ -89,7 +89,7 @@ Note: day calculations are based on UTC. If the traveler mentions a different lo
 class FeedbackAgent(BaseAgent):
     agent_name = "feedback"
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state=None) -> str:
         return SYSTEM_PROMPT
 
     async def handle(self, state: TripState, user_message: str) -> dict:

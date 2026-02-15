@@ -97,7 +97,7 @@ Then provide a formatted human-readable version.
 class SchedulerAgent(BaseAgent):
     agent_name = "scheduler"
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, state=None) -> str:
         return SYSTEM_PROMPT
 
     async def handle(self, state: TripState, user_message: str) -> dict:
